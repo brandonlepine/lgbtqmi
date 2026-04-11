@@ -1,4 +1,6 @@
-torch==2.11.0
+# NOTE: install PyTorch separately (CPU vs CUDA vs MPS differs by platform).
+# - RunPod/CUDA: install from PyTorch CUDA wheels index, then `pip install -r requirements.txt`.
+# - Local/MPS: `pip install torch` (or use the official macOS install instructions).
 transformers==5.5.3
 tokenizers==0.22.2
 huggingface-hub==1.10.1

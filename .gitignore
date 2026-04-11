@@ -55,16 +55,19 @@ datasets/**
 !datasets/.gitkeep
 
 # --- Data (allow small inputs, ignore typical large subdirs) ---
-data/raw/
+data/raw/*
 data/processed/
 data/cache/
 data/tmp/
 data/downloads/
 !data/.gitkeep
 
+# Allow committing the small CrowS-Pairs CSV for portability.
+!data/raw/crows_pairs.csv
+
 # --- Run outputs (ignore heavy artifacts; keep summaries/analysis/figures commit-friendly) ---
-results/runs/**/activations/
-results/runs/**/artifacts/
+results/runs/**
+results/figures/latest
 !results/.gitkeep
 
 # --- Alternative run root (some pipelines may use this) ---

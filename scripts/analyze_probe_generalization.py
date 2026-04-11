@@ -78,6 +78,42 @@ def load_category_data(
     return aligned_finals, aligned_metas, aligned_stimuli
 
 
+def load_crows_pairs_data(
+    run_dir: Path,
+    max_items: int | None = None,
+) -> tuple[list[np.ndarray], list[dict], list[dict]] | None:
+    """Load CrowS-Pairs activations + stimuli from a run directory."""
+    act_dir = run_dir / "activations" / "crows_pairs"
+    if not act_dir.exists():
+        return None
+
+    stimuli_files = sorted((run_dir / "stimuli").glob("stimuli_crows_pairs_*.json"))
+    if not stimuli_files:
+        return None
+    with open(stimuli_files[-1]) as f:
+        stimuli = json.load(f)
+
+    finals_by_idx, _ids_by_idx, metas_by_idx = load_activations_indexed(
+        act_dir,
+        max_items=max_items,
+        final_key="attn_pre_o_proj_final",
+    )
+
+    aligned_finals: list[np.ndarray] = []
+    aligned_metas: list[dict] = []
+    aligned_stimuli: list[dict] = []
+    for item in stimuli[: (max_items or len(stimuli))]:
+        idx = int(item["item_idx"])
+        if idx in finals_by_idx and idx in metas_by_idx:
+            aligned_finals.append(finals_by_idx[idx])
+            aligned_metas.append(metas_by_idx[idx])
+            aligned_stimuli.append(item)
+
+    if not aligned_finals:
+        return None
+    return aligned_finals, aligned_metas, aligned_stimuli
+
+
 def train_stereotyping_probe(
     finals: list[np.ndarray],
     metas: list[dict],
@@ -132,7 +168,12 @@ def main() -> None:
     parser.add_argument("--n_heads", type=int, required=True)
     parser.add_argument("--head_dim", type=int, required=True)
     parser.add_argument("--max_items", type=int, default=None)
-    parser.add_argument("--crows_pairs_path", type=str, default=None)
+    parser.add_argument(
+        "--crows_pairs_path",
+        type=str,
+        default=None,
+        help="Optional: path to CrowS-Pairs CSV. If omitted, will auto-detect extracted CrowS-Pairs under the run directory.",
+    )
     parser.add_argument("--model_id", type=str, default=None)
     args = parser.parse_args()
 
@@ -256,19 +297,61 @@ def main() -> None:
 
     # ===== Fig 16: Cross-benchmark (CrowS-Pairs) =====
     cross_benchmark_results: dict[str, dict] = {}
-    if args.crows_pairs_path and Path(args.crows_pairs_path).exists():
-        log(f"\n--- Fig 16: Cross-benchmark generalization ---")
-        log(f"  CrowS-Pairs path: {args.crows_pairs_path}")
-        # CrowS-Pairs integration would require additional activation extraction
-        # Placeholder: save empty results with a note
-        cross_benchmark_results = {
-            cat: {"accuracy": 0.5, "n_items": 0, "note": "requires CrowS-Pairs activations"}
-            for cat in available_cats
-        }
-        log("  NOTE: CrowS-Pairs analysis requires separate activation extraction. "
-            "Run extract_activations.py on CrowS-Pairs stimuli first.")
+    crows_data = load_crows_pairs_data(run_dir, max_items=args.max_items)
+    if crows_data is None:
+        log("\n  Skipping fig_16: no CrowS-Pairs activations found under this run")
     else:
-        log("\n  Skipping fig_16: no CrowS-Pairs data provided")
+        log(f"\n--- Fig 16: Cross-benchmark generalization (CrowS-Pairs) ---")
+        crows_finals, crows_metas, crows_stimuli = crows_data
+        mask_c, y_c = build_stereotyping_labels(crows_stimuli, crows_metas)
+        n_crows_used = int(mask_c.sum())
+        log(f"  CrowS-Pairs items loaded: {len(crows_finals)} (usable for Probe B: {n_crows_used})")
+
+        # Evaluate each source-category trained probe on CrowS-Pairs.
+        for source_cat in available_cats:
+            src_finals, src_metas, src_stimuli = cat_data[source_cat]
+            clf = train_stereotyping_probe(
+                src_finals, src_metas, src_stimuli,
+                best_layer, best_head, args.head_dim,
+            )
+            if clf is None or n_crows_used < 5:
+                cross_benchmark_results[source_cat] = {
+                    "accuracy": 0.5,
+                    "n_items": n_crows_used,
+                    "note": "insufficient data to train/evaluate",
+                }
+                continue
+
+            acc = evaluate_probe(
+                clf, crows_finals, crows_metas, crows_stimuli,
+                best_layer, best_head, args.head_dim,
+            )
+            cross_benchmark_results[source_cat] = {
+                "accuracy": float(acc),
+                "n_items": n_crows_used,
+            }
+
+        # Save a simple bar chart for fig_16
+        from src.visualization.style import apply_style, save_fig, CATEGORY_LABELS, TITLE_SIZE, TICK_SIZE, LABEL_SIZE
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        apply_style()
+        cats = sorted(cross_benchmark_results.keys())
+        accs = [cross_benchmark_results[c]["accuracy"] for c in cats]
+        labels = [CATEGORY_LABELS.get(c, c) for c in cats]
+        fig, ax = plt.subplots(figsize=(max(10, len(cats) * 1.3), 4.8))
+        ax.bar(range(len(cats)), accs, color="#0072B2", edgecolor="black", linewidth=0.6)
+        ax.axhline(0.5, color="gray", linewidth=1, linestyle="--", label="Chance")
+        ax.set_xticks(range(len(cats)))
+        ax.set_xticklabels(labels, rotation=45, ha="right", fontsize=TICK_SIZE)
+        ax.set_ylabel("CrowS-Pairs accuracy (Probe B)", fontsize=LABEL_SIZE)
+        ax.set_ylim(0.3, 1.0)
+        ax.set_title(f"Cross-benchmark transfer to CrowS-Pairs (L{best_layer}H{best_head})", fontsize=TITLE_SIZE)
+        ax.legend(fontsize=TICK_SIZE)
+        save_fig(fig, str(fig_dir / "fig_16_crows_pairs_transfer.png"))
+        log("  Saved fig_16")
 
     # Save results
     results = {

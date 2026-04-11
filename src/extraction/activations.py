@@ -69,6 +69,44 @@ def _answer_text_spans(prompt: str) -> dict[str, tuple[int, int]]:
     return spans
 
 
+def _identity_subspan_in_answer(
+    answer_text: str,
+    role_tag: str,
+) -> tuple[int, int] | None:
+    """Find the character span of the identity phrase inside an answer text.
+
+    We only use identity-bearing substrings that actually appear in the answer text.
+    If the role_tag is an abstract label (e.g., nonTrans_M) and doesn't appear,
+    we return None (so we don't accidentally use name tokens as identity tokens).
+    """
+    a = answer_text.lower()
+    t = str(role_tag).strip()
+    if not t:
+        return None
+    tl = t.lower()
+
+    # Direct match
+    i = a.find(tl)
+    if i != -1:
+        return (i, i + len(tl))
+
+    # Hyphen suffix (e.g., F-Black)
+    if "-" in tl:
+        suf = tl.split("-", 1)[1]
+        j = a.find(suf)
+        if j != -1:
+            return (j, j + len(suf))
+
+    # Underscore -> space (e.g., "trans_f" might appear as "trans f")
+    if "_" in tl:
+        spaced = tl.replace("_", " ")
+        j = a.find(spaced)
+        if j != -1:
+            return (j, j + len(spaced))
+
+    return None
+
+
 def _token_positions_overlapping_span(
     offsets: list[tuple[int, int]],
     span: tuple[int, int],
@@ -85,14 +123,35 @@ def _token_positions_overlapping_span(
     return pos
 
 
+def _filter_article_tokens(
+    token_positions: list[int],
+    input_ids: list[int],
+    tokenizer: Any,
+) -> list[int]:
+    """Remove positions that are just leading articles like 'the', 'a', 'an'."""
+    stop = {"a", "an", "the"}
+    out: list[int] = []
+    for p in token_positions:
+        if p < 0 or p >= len(input_ids):
+            continue
+        txt = tokenizer.decode([int(input_ids[p])]).strip().lower()
+        if txt in stop:
+            continue
+        out.append(p)
+    return out
+
+
 def _letters_by_role(item: dict[str, Any]) -> tuple[str, str, str]:
-    """Return (stereotyped_letter, non_stereotyped_letter, unknown_letter)."""
+    """Return (stereotyped_letter, non_stereotyped_letter, unknown_letter).
+
+    Some BBQ items may be missing a stereotyped target (e.g., metadata gaps).
+    In that case we return empty string for the missing role(s) and downstream
+    logic will treat identity spans as unavailable for delta computation.
+    """
     roles = item["answer_roles"]
     stereo = next((k for k, v in roles.items() if v == "stereotyped_target"), "")
     non = next((k for k, v in roles.items() if v == "non_stereotyped"), "")
     unk = next((k for k, v in roles.items() if v == "unknown"), "")
-    if not stereo or not non or not unk:
-        raise ValueError(f"Invalid answer_roles mapping: {roles}")
     return stereo, non, unk
 
 
@@ -155,6 +214,7 @@ def extract_activations_for_item(
     prompt = format_prompt(item)
     inputs = tokenizer(prompt, return_tensors="pt").to(device)
     seq_len = int(inputs["input_ids"].shape[1])
+    input_ids_list = inputs["input_ids"][0].detach().cpu().tolist()
 
     # Compute token positions for stereotyped vs non-stereotyped answer spans
     spans = _answer_text_spans(prompt)
@@ -183,8 +243,36 @@ def extract_activations_for_item(
         else:
             answer_token_positions[letter] = []
 
-    stereo_pos = answer_token_positions.get(stereo_letter, [])
-    non_pos = answer_token_positions.get(non_letter, [])
+    # Identity token positions: narrow to identity substring within the answer text, if available.
+    answer_role_tags = item.get("answer_role_tags", {})
+    answer_identity_token_positions: dict[str, list[int]] = {L: [] for L in ["A", "B", "C"]}
+    for letter in ["A", "B", "C"]:
+        if letter not in spans:
+            continue
+        role_tag = answer_role_tags.get(letter, "")
+        sub = _identity_subspan_in_answer(item["answers"][letter], role_tag)
+        if sub is None:
+            # Fallback: use answer span tokens (e.g., name-based answers) but filter out articles.
+            fallback = _filter_article_tokens(
+                answer_token_positions.get(letter, []),
+                input_ids_list,
+                tokenizer,
+            )
+            answer_identity_token_positions[letter] = fallback
+            continue
+        # Convert answer-local span to prompt-global span
+        base_start, _base_end = spans[letter]
+        global_span = (base_start + sub[0], base_start + sub[1])
+        answer_identity_token_positions[letter] = _token_positions_overlapping_span(
+            offsets, global_span
+        )
+
+    stereo_pos = (
+        answer_identity_token_positions.get(stereo_letter, []) if stereo_letter else []
+    )
+    non_pos = (
+        answer_identity_token_positions.get(non_letter, []) if non_letter else []
+    )
     all_identity_pos = sorted(set(stereo_pos + non_pos))
 
     # Register hooks on all decoder layers
@@ -300,7 +388,12 @@ def extract_activations_for_item(
         "stereotyped_letter": stereo_letter,
         "non_stereotyped_letter": non_letter,
         "unknown_letter": unk_letter,
+        "has_stereotyped_target": bool(stereo_letter),
+        "has_non_stereotyped": bool(non_letter),
+        "has_unknown": bool(unk_letter),
         "answer_token_positions": answer_token_positions,
+        "answer_identity_token_positions": answer_identity_token_positions,
+        "answer_role_tags": answer_role_tags,
         "stereotyped_token_positions": stereo_pos,
         "non_stereotyped_token_positions": non_pos,
         "all_identity_token_positions": all_identity_pos,

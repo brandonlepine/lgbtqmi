@@ -37,6 +37,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import torch
 
 from src.data.bbq_loader import CATEGORY_MAP, load_and_standardize, parse_categories
+from src.data.crows_pairs_loader import load_crows_pairs_as_stimuli, validate_crows_pairs_csv
 from src.extraction.activations import run_extraction
 from src.utils.io import atomic_save_json, ensure_dir
 from src.utils.logging import log
@@ -156,6 +157,18 @@ def main() -> None:
     parser.add_argument("--max_items", type=int, default=None, help="Max items per category (for testing)")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for answer shuffling")
     parser.add_argument("--run_date", type=str, default=None, help="Override run date")
+    parser.add_argument(
+        "--crows_pairs_path",
+        type=str,
+        default=None,
+        help="Optional: path to CrowS-Pairs CSV. If set, will prepare stimuli + extract activations under activations/crows_pairs/.",
+    )
+    parser.add_argument(
+        "--crows_max_items",
+        type=int,
+        default=None,
+        help="Optional: max items for CrowS-Pairs (default: --max_items, else all).",
+    )
 
     args = parser.parse_args()
     run_date = args.run_date or date.today().isoformat()
@@ -238,6 +251,60 @@ def main() -> None:
         log(f"Category {cat} done in {elapsed:.1f}s")
 
         # Free MPS memory between categories
+        if args.device == "mps":
+            torch.mps.empty_cache()
+
+    # Step 2c: Optional CrowS-Pairs
+    if args.crows_pairs_path:
+        crows_path = Path(args.crows_pairs_path)
+        if not crows_path.exists():
+            raise FileNotFoundError(f"CrowS-Pairs CSV not found: {crows_path}")
+
+        log(f"\n{'='*60}")
+        log("CROWS-PAIRS")
+        log(f"{'='*60}")
+        schema = validate_crows_pairs_csv(crows_path)
+        log(f"  CrowS-Pairs rows: {schema['n_rows']}")
+
+        crows_n = args.crows_max_items if args.crows_max_items is not None else args.max_items
+        stimuli_path = stimuli_dir / f"stimuli_crows_pairs_{run_date}.json"
+
+        if stimuli_path.exists():
+            log(f"Stimuli exists -> {stimuli_path} (reusing)")
+            with open(stimuli_path) as f:
+                crows_items = json.load(f)
+        else:
+            log("Preparing CrowS-Pairs stimuli...")
+            crows_items = load_crows_pairs_as_stimuli(crows_path, max_items=crows_n)
+            atomic_save_json(crows_items, stimuli_path)
+            log(f"Stimuli saved -> {stimuli_path}")
+
+        output_dir = str(activations_base / "crows_pairs")
+        ensure_dir(output_dir)
+
+        log("Extracting CrowS-Pairs activations...")
+        t1 = time.time()
+        summary = run_extraction(
+            items=crows_items,
+            model=model,
+            tokenizer=tokenizer,
+            device=args.device,
+            n_layers=n_layers,
+            hidden_dim=hidden_dim,
+            get_layer_fn=get_layer_fn,
+            get_o_proj_fn=get_o_proj_fn,
+            output_dir=output_dir,
+            max_items=crows_n,
+        )
+        elapsed = time.time() - t1
+        summary["category"] = "crows_pairs"
+        summary["elapsed_seconds"] = round(elapsed, 1)
+        summary["stimuli_path"] = str(stimuli_path)
+        summary["activations_dir"] = output_dir
+        summary["schema"] = schema
+        pipeline_summary["crows_pairs"] = summary
+
+        log(f"CrowS-Pairs done in {elapsed:.1f}s")
         if args.device == "mps":
             torch.mps.empty_cache()
 

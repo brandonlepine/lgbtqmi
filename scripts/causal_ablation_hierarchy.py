@@ -109,8 +109,12 @@ def _load_model(model_path: str, device: str):
 def run_behavioral_eval(
     model, tokenizer, stimuli_items: list[dict], device: str,
     condition: str = "ambig",
-) -> dict:
-    """Run model on stimuli and compute bias scores."""
+) -> tuple[dict, list[str]]:
+    """Run model on stimuli and compute bias scores.
+
+    Returns:
+        (score_dict, predictions)
+    """
     predictions: list[str] = []
     for item in stimuli_items:
         prompt = format_prompt(item)
@@ -122,7 +126,65 @@ def run_behavioral_eval(
         best_letter, _ = best_choice_from_logits(logits, tokenizer)
         predictions.append(best_letter or "")
 
-    return compute_bias_score(stimuli_items, predictions, condition)
+    return compute_bias_score(stimuli_items, predictions, condition), predictions
+
+
+def _count_changed(
+    items: list[dict],
+    preds_a: list[str],
+    preds_b: list[str],
+    *,
+    condition: str = "ambig",
+) -> int:
+    changed = 0
+    for it, a, b in zip(items, preds_a, preds_b):
+        if it.get("context_condition") != condition:
+            continue
+        if a != b:
+            changed += 1
+    return changed
+
+
+def _count_changed_non_unknown(
+    items: list[dict],
+    preds_a: list[str],
+    preds_b: list[str],
+    *,
+    condition: str = "ambig",
+) -> int:
+    """Count changed predictions among ambig items where both are non-unknown."""
+    changed = 0
+    for it, a, b in zip(items, preds_a, preds_b):
+        if it.get("context_condition") != condition:
+            continue
+        roles = it.get("answer_roles", {})
+        ra = roles.get(a, "unknown")
+        rb = roles.get(b, "unknown")
+        if ra == "unknown" or rb == "unknown":
+            continue
+        if a != b:
+            changed += 1
+    return changed
+
+
+def _transition_counts(
+    items: list[dict],
+    preds_a: list[str],
+    preds_b: list[str],
+    *,
+    condition: str = "ambig",
+) -> dict[str, int]:
+    """Count role transitions (stereo/non/unknown) baseline->ablated on ambig items."""
+    counts: dict[str, int] = {}
+    for it, a, b in zip(items, preds_a, preds_b):
+        if it.get("context_condition") != condition:
+            continue
+        roles = it.get("answer_roles", {})
+        ra = roles.get(a, "unknown")
+        rb = roles.get(b, "unknown")
+        key = f"{ra}->{rb}"
+        counts[key] = counts.get(key, 0) + 1
+    return counts
 
 
 def main() -> None:
@@ -165,10 +227,12 @@ def main() -> None:
     n_layers = list(cat_directions.values())[0].shape[0]
     mid_layer = n_layers // 2
 
-    # Compute shared component
-    sca = shared_component_analysis(cat_directions, mid_layer)
-    shared_dir = sca["shared_direction"]
-    log(f"Shared direction extracted at layer {mid_layer}")
+    # Compute shared component per layer (more correct than using one mid-layer vector everywhere)
+    shared_dirs_by_layer: dict[int, np.ndarray] = {}
+    for layer in range(n_layers):
+        sca = shared_component_analysis(cat_directions, layer)
+        shared_dirs_by_layer[layer] = sca["shared_direction"]
+    log(f"Shared direction extracted per-layer (representative layer={mid_layer})")
 
     # Load stimuli per category
     cat_stimuli: dict[str, list[dict]] = {}
@@ -199,44 +263,64 @@ def main() -> None:
 
         # Baseline
         log("  Baseline...")
-        baseline = run_behavioral_eval(model, tokenizer, items, args.device)
+        baseline, preds_base = run_behavioral_eval(model, tokenizer, items, args.device)
         log(f"  Baseline bias: {baseline['bias_score']:.3f}")
+        log(f"  Baseline n_non_unknown={baseline['n_non_unknown']}/{baseline['n_total']}")
 
         # Intervention 5a: Ablate shared direction
         log("  Ablating shared direction...")
-        hooks = apply_direction_ablation(model, get_layer_fn, shared_dir, all_layers, args.device)
-        shared_result = run_behavioral_eval(model, tokenizer, items, args.device)
+        dirs_per_layer = {l: [shared_dirs_by_layer[l]] for l in all_layers}
+        hooks = apply_multi_direction_ablation(model, get_layer_fn, dirs_per_layer, args.device)
+        shared_result, preds_shared = run_behavioral_eval(model, tokenizer, items, args.device)
         remove_hooks(hooks)
         log(f"  Shared ablation bias: {shared_result['bias_score']:.3f}")
+        log(
+            f"  Shared ablation n_non_unknown={shared_result['n_non_unknown']}/{shared_result['n_total']} "
+            f"changed_ambig={_count_changed(items, preds_base, preds_shared)} "
+            f"changed_non_unknown_ambig={_count_changed_non_unknown(items, preds_base, preds_shared)}"
+        )
+        log(f"  Shared transitions: {_transition_counts(items, preds_base, preds_shared)}")
 
         # Intervention 5c: Ablate category-specific direction
         if cat in cat_directions:
-            cat_dir = cat_directions[cat][mid_layer]
-            # Category-specific = direction minus shared projection
-            proj = np.dot(cat_dir, shared_dir) * shared_dir
-            specific_dir = cat_dir - proj
-            specific_norm = np.linalg.norm(specific_dir)
+            # Category-specific per layer = cat_dir[layer] - proj onto shared_dir[layer]
+            specific_dirs_by_layer: dict[int, np.ndarray] = {}
+            for l in all_layers:
+                cd = cat_directions[cat][l]
+                sd = shared_dirs_by_layer[l]
+                proj = float(np.dot(cd, sd)) * sd
+                sp = cd - proj
+                nrm = float(np.linalg.norm(sp))
+                if nrm > 1e-8:
+                    sp = sp / nrm
+                specific_dirs_by_layer[l] = sp.astype(np.float32)
 
-            if specific_norm > 1e-6:
-                specific_dir = specific_dir / specific_norm
-                log("  Ablating category-specific direction...")
-                hooks = apply_direction_ablation(
-                    model, get_layer_fn, specific_dir, all_layers, args.device
-                )
-                specific_result = run_behavioral_eval(model, tokenizer, items, args.device)
-                remove_hooks(hooks)
-                log(f"  Specific ablation bias: {specific_result['bias_score']:.3f}")
-            else:
-                specific_result = baseline
-                log("  Specific direction too small, skipping")
+            log("  Ablating category-specific direction...")
+            dirs_per_layer = {l: [specific_dirs_by_layer[l]] for l in all_layers}
+            hooks = apply_multi_direction_ablation(model, get_layer_fn, dirs_per_layer, args.device)
+            specific_result, preds_specific = run_behavioral_eval(model, tokenizer, items, args.device)
+            remove_hooks(hooks)
+            log(f"  Specific ablation bias: {specific_result['bias_score']:.3f}")
+            log(
+                f"  Specific ablation n_non_unknown={specific_result['n_non_unknown']}/{specific_result['n_total']} "
+                f"changed_ambig={_count_changed(items, preds_base, preds_specific)} "
+                f"changed_non_unknown_ambig={_count_changed_non_unknown(items, preds_base, preds_specific)}"
+            )
+            log(f"  Specific transitions: {_transition_counts(items, preds_base, preds_specific)}")
 
             # Ablate both
             log("  Ablating both directions...")
-            dirs_per_layer = {l: [shared_dir, specific_dir] for l in all_layers}
+            dirs_per_layer = {l: [shared_dirs_by_layer[l], specific_dirs_by_layer[l]] for l in all_layers}
             hooks = apply_multi_direction_ablation(model, get_layer_fn, dirs_per_layer, args.device)
-            both_result = run_behavioral_eval(model, tokenizer, items, args.device)
+            both_result, preds_both = run_behavioral_eval(model, tokenizer, items, args.device)
             remove_hooks(hooks)
             log(f"  Both ablation bias: {both_result['bias_score']:.3f}")
+            log(
+                f"  Both ablation n_non_unknown={both_result['n_non_unknown']}/{both_result['n_total']} "
+                f"changed_ambig={_count_changed(items, preds_base, preds_both)} "
+                f"changed_non_unknown_ambig={_count_changed_non_unknown(items, preds_base, preds_both)}"
+            )
+            log(f"  Both transitions: {_transition_counts(items, preds_base, preds_both)}")
         else:
             specific_result = baseline
             both_result = baseline
@@ -247,6 +331,30 @@ def main() -> None:
             "ablate_specific": specific_result["bias_score"],
             "ablate_both": both_result["bias_score"],
             "n_items": baseline["n_total"],
+            "baseline_n_non_unknown": baseline["n_non_unknown"],
+            "shared_n_non_unknown": shared_result["n_non_unknown"],
+            "specific_n_non_unknown": specific_result.get("n_non_unknown", baseline["n_non_unknown"]),
+            "both_n_non_unknown": both_result.get("n_non_unknown", baseline["n_non_unknown"]),
+            "baseline_counts": {
+                "n_stereo": baseline["n_stereo"],
+                "n_non_stereo": baseline["n_non_stereo"],
+                "n_unknown": baseline["n_unknown"],
+            },
+            "shared_counts": {
+                "n_stereo": shared_result["n_stereo"],
+                "n_non_stereo": shared_result["n_non_stereo"],
+                "n_unknown": shared_result["n_unknown"],
+            },
+            "specific_counts": {
+                "n_stereo": specific_result.get("n_stereo", baseline["n_stereo"]),
+                "n_non_stereo": specific_result.get("n_non_stereo", baseline["n_non_stereo"]),
+                "n_unknown": specific_result.get("n_unknown", baseline["n_unknown"]),
+            },
+            "both_counts": {
+                "n_stereo": both_result.get("n_stereo", baseline["n_stereo"]),
+                "n_non_stereo": both_result.get("n_non_stereo", baseline["n_non_stereo"]),
+                "n_unknown": both_result.get("n_unknown", baseline["n_unknown"]),
+            },
         }
 
         # Memory management
@@ -282,7 +390,7 @@ def main() -> None:
                     if cat not in cat_stimuli:
                         continue
                     items = cat_stimuli[cat]
-                    result = run_behavioral_eval(model, tokenizer, items, args.device)
+                    result, _ = run_behavioral_eval(model, tokenizer, items, args.device)
                     rlhf_results[cat] = {
                         "base_baseline": ablation_results.get(cat, {}).get("baseline", 0),
                         "base_ablated": result["bias_score"],
@@ -299,7 +407,7 @@ def main() -> None:
                         if cat not in cat_stimuli:
                             continue
                         items = cat_stimuli[cat]
-                        chat_result = run_behavioral_eval(
+                        chat_result, _ = run_behavioral_eval(
                             chat_model, chat_tok, items, args.device
                         )
                         rlhf_results[cat]["chat_baseline"] = chat_result["bias_score"]
@@ -343,7 +451,7 @@ def main() -> None:
                 if measure_cat not in cat_stimuli:
                     continue
                 items = cat_stimuli[measure_cat]
-                result = run_behavioral_eval(model, tokenizer, items, args.device)
+                result, _ = run_behavioral_eval(model, tokenizer, items, args.device)
                 cross_ablation[i + 1, j] = result["bias_score"] - ablation_results[measure_cat]["baseline"]
 
             remove_hooks(hooks)

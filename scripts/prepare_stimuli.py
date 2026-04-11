@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Prepare standardized stimuli from BBQ JSONL files for all bias categories.
+"""Prepare standardized stimuli from BBQ JSONL files (and optionally CrowS-Pairs).
 
 Usage:
     python scripts/prepare_stimuli.py --categories so,gi,race --output_dir data/processed
     python scripts/prepare_stimuli.py --categories all
     python scripts/prepare_stimuli.py --categories so --max_items 20
+    python scripts/prepare_stimuli.py --crows_pairs_path data/raw/crows_pairs.csv --output_dir data/processed
 """
 
 import argparse
@@ -23,6 +24,7 @@ from src.data.bbq_loader import (
 )
 from src.utils.io import atomic_save_json
 from src.utils.logging import log
+from src.data.crows_pairs_loader import load_crows_pairs_as_stimuli, validate_crows_pairs_csv
 
 
 def main() -> None:
@@ -65,10 +67,16 @@ def main() -> None:
         default=None,
         help="Date string for output filenames (default: today)",
     )
+    parser.add_argument(
+        "--crows_pairs_path",
+        type=str,
+        default=None,
+        help="Optional: path to CrowS-Pairs CSV (will produce stimuli_crows_pairs_<date>.json)",
+    )
 
     args = parser.parse_args()
     date_str = args.date or date.today().isoformat()
-    categories = parse_categories(args.categories)
+    categories = parse_categories(args.categories) if args.crows_pairs_path is None else []
 
     log(f"Preparing stimuli for {len(categories)} categories: {categories}")
     log(f"BBQ data dir: {args.bbq_data_dir}")
@@ -78,6 +86,22 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     summary: dict[str, dict] = {}
+
+    if args.crows_pairs_path:
+        log(f"\n{'='*60}")
+        log("Processing CrowS-Pairs")
+        log(f"{'='*60}")
+        schema = validate_crows_pairs_csv(args.crows_pairs_path)
+        log(f"  CrowS-Pairs rows: {schema['n_rows']}")
+        items = load_crows_pairs_as_stimuli(args.crows_pairs_path, max_items=args.max_items)
+        out_path = output_dir / f"stimuli_crows_pairs_{date_str}.json"
+        atomic_save_json(items, out_path)
+        log(f"  Saved {len(items)} items -> {out_path}")
+        summary["crows_pairs"] = {
+            "n_items": len(items),
+            "output_path": str(out_path),
+            "schema": schema,
+        }
 
     for cat in categories:
         bbq_name = CATEGORY_MAP[cat]

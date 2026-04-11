@@ -67,9 +67,13 @@ def collect_layer_features(
         X: (n_items, n_features)
     """
     features = np.stack([hf[layer] for hf in hidden_finals], axis=0)
-    if pca_components is not None and pca_components < features.shape[1]:
-        pca = PCA(n_components=pca_components)
-        features = pca.fit_transform(features)
+    if pca_components is not None:
+        n_samples, n_features = features.shape
+        # PCA requires n_components <= min(n_samples, n_features).
+        k = int(min(pca_components, n_samples, n_features))
+        if k >= 1 and k < n_features:
+            pca = PCA(n_components=k)
+            features = pca.fit_transform(features)
     return features
 
 

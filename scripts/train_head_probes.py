@@ -171,19 +171,40 @@ def run_probes_for_model(
         mask_sg, y_sg, le_sg = build_subgroup_labels(so_stimuli)
         log(f"  SO sub-groups: {list(le_sg.classes_)}")
 
+        # Build raw per-layer features (no PCA here to avoid CV leakage).
+        from sklearn.decomposition import PCA
+        from sklearn.linear_model import RidgeClassifier
+        from sklearn.model_selection import StratifiedKFold, cross_val_predict, cross_val_score
+        from sklearn.pipeline import Pipeline
+
+        def _safe_pca_k(n_samples: int, n_features: int, desired: int, n_splits: int) -> int:
+            # PCA runs inside CV folds; ensure k <= min(n_train, n_features) for all folds.
+            test_max = int(np.ceil(n_samples / max(n_splits, 2)))
+            n_train_min = max(n_samples - test_max, 1)
+            return int(max(1, min(desired, n_train_min, n_features)))
+
+        # Choose CV folds safely based on smallest class.
+        binc = np.bincount(y_sg, minlength=len(le_sg.classes_))
+        min_per_class = int(binc.min()) if len(binc) else 0
+        n_splits = int(min(5, max(2, min_per_class))) if min_per_class > 0 else 2
+        skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
+
         # Find best layer for sub-group probe
         best_sg_acc = 0.0
         best_sg_layer = 0
         for layer in range(n_layers):
-            from src.analysis.probes import collect_layer_features
-            X = collect_layer_features(
-                [so_finals[i] for i, m in enumerate(mask_sg) if m],
-                layer, pca_components=min(50, head_dim),
+            X_raw = np.stack(
+                [so_finals[i][layer] for i, m in enumerate(mask_sg) if m],
+                axis=0,
             )
-            y_filtered = y_sg
-            result = train_probe_cv(X, y_filtered)
-            if result["mean_accuracy"] > best_sg_acc:
-                best_sg_acc = result["mean_accuracy"]
+            desired = int(min(50, head_dim))
+            k = _safe_pca_k(X_raw.shape[0], X_raw.shape[1], desired, n_splits)
+            pipe = Pipeline(
+                [("pca", PCA(n_components=k)), ("clf", RidgeClassifier(alpha=1.0))]
+            )
+            acc = float(np.mean(cross_val_score(pipe, X_raw, y_sg, cv=skf)))
+            if acc > best_sg_acc:
+                best_sg_acc = acc
                 best_sg_layer = layer
 
         log(f"  Best sub-group layer: {best_sg_layer} (acc={best_sg_acc:.3f})")
@@ -192,15 +213,17 @@ def run_probes_for_model(
         results["subgroup_classes"] = list(le_sg.classes_)
 
         # Build confusion matrix at best layer
-        from sklearn.model_selection import cross_val_predict
-        from sklearn.linear_model import RidgeClassifier
-        X_best = collect_layer_features(
-            [so_finals[i] for i, m in enumerate(mask_sg) if m],
-            best_sg_layer, pca_components=min(50, head_dim),
+        X_best_raw = np.stack(
+            [so_finals[i][best_sg_layer] for i, m in enumerate(mask_sg) if m],
+            axis=0,
         )
-        clf = RidgeClassifier(alpha=1.0)
-        y_pred = cross_val_predict(clf, X_best, y_sg, cv=5)
-        conf = confusion_matrix(y_sg, y_pred)
+        desired = int(min(50, head_dim))
+        k = _safe_pca_k(X_best_raw.shape[0], X_best_raw.shape[1], desired, n_splits)
+        pipe = Pipeline([("pca", PCA(n_components=k)), ("clf", RidgeClassifier(alpha=1.0))])
+        y_pred = cross_val_predict(pipe, X_best_raw, y_sg, cv=skf)
+        conf = confusion_matrix(
+            y_sg, y_pred, labels=list(range(len(le_sg.classes_)))
+        )
         results["subgroup_confusion"] = conf
         results["subgroup_classes_list"] = list(le_sg.classes_)
     else:

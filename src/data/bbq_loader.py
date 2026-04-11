@@ -107,6 +107,18 @@ def _classify_answer_role(
     # Check if this role tag matches any stereotyped group
     stereo_lower = [g.lower().strip() for g in stereotyped_groups]
 
+    # GI has cases where stereotyped_groups is ["F"] or ["M"] while tags are "woman"/"man".
+    if any(sg in ("f", "m") for sg in stereo_lower):
+        if "f" in stereo_lower and tag_lower in ("woman", "girl", "female"):
+            return "stereotyped_target"
+        if "m" in stereo_lower and tag_lower in ("man", "boy", "male"):
+            return "stereotyped_target"
+
+    # GI also uses tags like trans_F / nonTrans_M while stereotyped_groups include "trans".
+    if any("trans" in sg for sg in stereo_lower):
+        if "trans" in tag_lower and not tag_lower.startswith("nontrans"):
+            return "stereotyped_target"
+
     # Exact match
     if tag_lower in stereo_lower:
         return "stereotyped_target"
@@ -154,9 +166,10 @@ def _determine_alignment(
 def _shuffle_answers(
     ans_texts: list[str],
     ans_roles: list[str],
+    ans_role_tags: list[str],
     correct_idx: int,
     rng: random.Random,
-) -> tuple[dict[str, str], str, dict[str, str]]:
+) -> tuple[dict[str, str], str, dict[str, str], dict[str, str]]:
     """Shuffle answer positions and return (answers, correct_letter, answer_roles).
 
     Args:
@@ -169,6 +182,7 @@ def _shuffle_answers(
         answers: {"A": text, "B": text, "C": text}
         correct_letter: "A", "B", or "C"
         answer_roles: {"A": role, "B": role, "C": role}
+        answer_role_tags: {"A": tag, "B": tag, "C": tag} (from answer_info)
     """
     indices = [0, 1, 2]
     rng.shuffle(indices)
@@ -176,15 +190,17 @@ def _shuffle_answers(
 
     answers = {}
     answer_roles = {}
+    answer_role_tags_by_letter = {}
     correct_letter = ""
 
     for letter, idx in zip(letters, indices):
         answers[letter] = ans_texts[idx]
         answer_roles[letter] = ans_roles[idx]
+        answer_role_tags_by_letter[letter] = ans_role_tags[idx]
         if idx == correct_idx:
             correct_letter = letter
 
-    return answers, correct_letter, answer_roles
+    return answers, correct_letter, answer_roles, answer_role_tags_by_letter
 
 
 def standardize_item(
@@ -214,8 +230,8 @@ def standardize_item(
     correct_idx = raw["label"]
 
     # Shuffle
-    answers, correct_letter, answer_roles = _shuffle_answers(
-        ans_texts, ans_roles, correct_idx, rng
+    answers, correct_letter, answer_roles, answer_role_tags_by_letter = _shuffle_answers(
+        ans_texts, ans_roles, ans_role_tags, correct_idx, rng
     )
 
     # Determine alignment
@@ -242,6 +258,7 @@ def standardize_item(
         "alignment": alignment,
         "stereotyped_groups": stereotyped_groups,
         "answer_roles": answer_roles,
+        "answer_role_tags": answer_role_tags_by_letter,
         "identity_role_tags": identity_role_tags,
         "subcategory": raw["additional_metadata"].get("subcategory", "None"),
     }
@@ -268,8 +285,12 @@ def load_and_standardize(
 
     rng = random.Random(seed)
     standardized = []
-    for i, raw in enumerate(raw_items):
-        standardized.append(standardize_item(raw, i, rng))
+    # Deterministically shuffle items for better subgroup coverage in small subsets,
+    # while preserving original indices for alignment/debugging.
+    indexed = list(enumerate(raw_items))
+    rng.shuffle(indexed)
+    for original_idx, raw in indexed:
+        standardized.append(standardize_item(raw, original_idx, rng))
 
     # Log role distribution
     role_counts: dict[str, int] = {"stereotyped_target": 0, "non_stereotyped": 0, "unknown": 0}

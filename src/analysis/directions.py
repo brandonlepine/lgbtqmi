@@ -207,7 +207,7 @@ def compute_gender_decomposition(
     """Compute gender decomposition for Sexual Orientation directions.
 
     gender_dir = (gay_dir - lesbian_dir) / 2
-    orientation_dir = (gay_dir + lesbian_dir) / 2
+    gl_family_dir = (gay_dir + lesbian_dir) / 2
 
     Also computes family directions:
     GL = mean(gay, lesbian)
@@ -222,17 +222,15 @@ def compute_gender_decomposition(
         lesbian = subgroup_dirs["lesbian"]
 
         gender_raw = (gay - lesbian) / 2.0
-        orientation_raw = (gay + lesbian) / 2.0
+        gl_family_raw = (gay + lesbian) / 2.0
 
         # Unit-normalize per layer
-        for name, raw in [("gender", gender_raw), ("orientation", orientation_raw)]:
+        for name, raw in [("gender", gender_raw), ("gl_family", gl_family_raw)]:
             norms = np.linalg.norm(raw, axis=1, keepdims=True)
             norms = np.maximum(norms, 1e-8)
             results[name] = (raw / norms).astype(np.float32)
 
-        # GL family direction
-        results["gl_family"] = compute_category_direction([gay, lesbian])
-        log("    Computed gender decomposition: gender, orientation, GL family")
+        log("    Computed SO decomposition: gender, gl_family")
 
     if "bisexual" in subgroup_dirs and "pansexual" in subgroup_dirs:
         bp_raw = (subgroup_dirs["bisexual"] + subgroup_dirs["pansexual"]) / 2.0

@@ -1,5 +1,9 @@
 """Heatmap visualizations: cosine matrices, probe accuracy maps, bias changes."""
 
+from __future__ import annotations
+
+from typing import Optional
+
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -31,7 +35,6 @@ def plot_cosine_heatmap(
         path: output file path
         order: optional reordering of names (e.g., from clustering)
     """
-    from typing import Optional as Opt  # avoid forward ref
     apply_style()
 
     if order is not None:
@@ -174,13 +177,17 @@ def plot_dual_heatmaps(
                     ax.text(j, i, f"{val:.2f}", ha="center", va="center",
                             fontsize=ANNOT_SIZE, color=color)
 
-    fig.colorbar(im, ax=[ax1, ax2], shrink=0.8, label="Cosine similarity")
+    # Reserve space for a dedicated colorbar axis so it never overlaps the heatmaps.
+    fig.subplots_adjust(right=0.86, wspace=0.25)
+    cax = fig.add_axes([0.88, 0.18, 0.02, 0.64])
+    cbar = fig.colorbar(im, cax=cax)
+    cbar.set_label("Cosine similarity", fontsize=LABEL_SIZE)
     if suptitle:
         fig.suptitle(suptitle, fontsize=TITLE_SIZE + 1, y=1.02)
 
     label_panel(ax1, "A")
     label_panel(ax2, "B")
-    save_fig(fig, path)
+    save_fig(fig, path, tight=False)
 
 
 def plot_fragmentation_grid(
@@ -272,5 +279,4 @@ def plot_transfer_matrix(
     save_fig(fig, path)
 
 
-# Need Optional import at module level for type hints in function signatures
-from typing import Optional
+

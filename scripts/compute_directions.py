@@ -189,12 +189,13 @@ def main() -> None:
     atomic_save_json(summary, summary_path)
     log(f"  Summary -> {summary_path}")
 
-    # Quick cross-category cosine preview
-    if len(all_category_directions) >= 2:
+    # Quick cross-category cosine preview (base categories only)
+    base_only = {k: v for k, v in all_category_directions.items() if k in categories}
+    if len(base_only) >= 2:
         # Use middle layer
-        n_layers = list(all_category_directions.values())[0].shape[0]
+        n_layers = list(base_only.values())[0].shape[0]
         mid_layer = n_layers // 2
-        sim, names = cosine_similarity_matrix(all_category_directions, mid_layer)
+        sim, names = cosine_similarity_matrix(base_only, mid_layer)
         log(f"\n  Cross-category cosines at layer {mid_layer}:")
         for i, ni in enumerate(names):
             for j, nj in enumerate(names):
