@@ -270,7 +270,9 @@ def main() -> None:
         # Intervention 5a: Ablate shared direction
         log("  Ablating shared direction...")
         dirs_per_layer = {l: [shared_dirs_by_layer[l]] for l in all_layers}
-        hooks = apply_multi_direction_ablation(model, get_layer_fn, dirs_per_layer, args.device)
+        hooks = apply_multi_direction_ablation(
+            model, get_layer_fn, dirs_per_layer, args.device, hidden_dim=hidden_dim
+        )
         shared_result, preds_shared = run_behavioral_eval(model, tokenizer, items, args.device)
         remove_hooks(hooks)
         log(f"  Shared ablation bias: {shared_result['bias_score']:.3f}")
@@ -297,7 +299,9 @@ def main() -> None:
 
             log("  Ablating category-specific direction...")
             dirs_per_layer = {l: [specific_dirs_by_layer[l]] for l in all_layers}
-            hooks = apply_multi_direction_ablation(model, get_layer_fn, dirs_per_layer, args.device)
+            hooks = apply_multi_direction_ablation(
+                model, get_layer_fn, dirs_per_layer, args.device, hidden_dim=hidden_dim
+            )
             specific_result, preds_specific = run_behavioral_eval(model, tokenizer, items, args.device)
             remove_hooks(hooks)
             log(f"  Specific ablation bias: {specific_result['bias_score']:.3f}")
@@ -311,7 +315,9 @@ def main() -> None:
             # Ablate both
             log("  Ablating both directions...")
             dirs_per_layer = {l: [shared_dirs_by_layer[l], specific_dirs_by_layer[l]] for l in all_layers}
-            hooks = apply_multi_direction_ablation(model, get_layer_fn, dirs_per_layer, args.device)
+            hooks = apply_multi_direction_ablation(
+                model, get_layer_fn, dirs_per_layer, args.device, hidden_dim=hidden_dim
+            )
             both_result, preds_both = run_behavioral_eval(model, tokenizer, items, args.device)
             remove_hooks(hooks)
             log(f"  Both ablation bias: {both_result['bias_score']:.3f}")
@@ -445,7 +451,14 @@ def main() -> None:
             if ablate_cat not in cat_directions:
                 continue
             ablate_dir = cat_directions[ablate_cat][mid_layer]
-            hooks = apply_direction_ablation(model, get_layer_fn, ablate_dir, all_layers, args.device)
+            hooks = apply_direction_ablation(
+                model,
+                get_layer_fn,
+                ablate_dir,
+                all_layers,
+                args.device,
+                hidden_dim=hidden_dim,
+            )
 
             for j, measure_cat in enumerate(available):
                 if measure_cat not in cat_stimuli:

@@ -100,7 +100,12 @@ class ModelWrapper:
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
         dtype = _select_dtype_for_device(device)
-        tokenizer = AutoTokenizer.from_pretrained(model_path)
+        tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=True)
+        if not getattr(tokenizer, "is_fast", False):
+            raise RuntimeError(
+                "This pipeline requires a fast tokenizer (offset mapping needed for "
+                "answer-span alignment). The loaded tokenizer is not fast."
+            )
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
 

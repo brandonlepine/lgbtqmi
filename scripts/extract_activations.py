@@ -64,7 +64,12 @@ def _load_model_and_tokenizer(
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     log(f"Loading tokenizer from {model_path}")
-    tokenizer = AutoTokenizer.from_pretrained(model_path)
+    tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=True)
+    if not getattr(tokenizer, "is_fast", False):
+        raise RuntimeError(
+            "Tokenizer is not fast; offset mapping is required for extraction. "
+            "Use a model with a fast tokenizer or ensure the fast tokenizer is available."
+        )
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 

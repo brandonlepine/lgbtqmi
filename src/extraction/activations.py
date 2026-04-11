@@ -161,19 +161,31 @@ def _validate_hook_output(
 ) -> torch.Tensor:
     """Extract hidden states from a hook output, validating the structure.
 
-    Different architectures return different output tuple structures.
-    We check output[0] shape to confirm it's (batch, seq_len, hidden_dim).
+    Different architectures can return different output tuple structures for
+    decoder layers. We locate a (batch, seq, hidden_dim) tensor rather than
+    assuming it is `output[0]`.
     """
-    if isinstance(output, tuple):
-        candidate = output[0]
-    elif isinstance(output, torch.Tensor):
+    candidate: torch.Tensor | None = None
+
+    if isinstance(output, torch.Tensor):
         candidate = output
+    elif isinstance(output, tuple):
+        for x in output:
+            if isinstance(x, torch.Tensor) and x.dim() == 3 and x.shape[-1] == expected_hidden_dim:
+                candidate = x
+                break
     else:
         raise ValueError(f"Unexpected hook output type: {type(output)}")
 
+    if candidate is None:
+        raise ValueError(
+            "Could not locate (batch, seq, hidden_dim) hidden state in hook output "
+            f"(hidden_dim={expected_hidden_dim})."
+        )
+
     if candidate.dim() != 3:
         raise ValueError(
-            f"Expected 3D hidden state (batch, seq, dim), got shape {candidate.shape}"
+            f"Expected 3D hidden state (batch, seq, dim), got shape {tuple(candidate.shape)}"
         )
     if candidate.shape[-1] != expected_hidden_dim:
         raise ValueError(
