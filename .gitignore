@@ -1,0 +1,94 @@
+# --- OS / editor ---
+.DS_Store
+.AppleDouble
+._*
+.Spotlight-V100
+.Trashes
+
+.cursor/
+
+.vscode/
+.idea/
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+dist/
+build/
+*.egg-info/
+
+# --- Environments ---
+.env
+.venv/
+venv/
+ENV/
+
+# --- Jupyter ---
+.ipynb_checkpoints/
+
+# --- Local secrets / config ---
+*.pem
+*.key
+*.p12
+*.pfx
+
+# --- Model weights / checkpoints (large) ---
+models/
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.ckpt
+*.gguf
+*.onnx
+
+# --- Preprocessed datasets (can be huge; keep out of git) ---
+datasets/**
+!datasets/.gitkeep
+
+# --- Data (allow small inputs, ignore typical large subdirs) ---
+data/raw/
+data/processed/
+data/cache/
+data/tmp/
+data/downloads/
+!data/.gitkeep
+
+# --- Run outputs (ignore heavy artifacts; keep summaries/analysis/figures commit-friendly) ---
+results/runs/**/activations/
+results/runs/**/artifacts/
+!results/.gitkeep
+
+# --- Alternative run root (some pipelines may use this) ---
+runs/
+
+# --- Figures (often lightweight enough to commit; keep allowed by default) ---
+!figures/.gitkeep
+
+# --- Numpy / arrays (large) ---
+*.npz
+*.npy
+*.np
+
+# --- Common large archives ---
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.7z
+*.rar
+
+# --- Logs ---
+*.log
+
+# --- Local agent notes ---
+CLAUDE.md
+
