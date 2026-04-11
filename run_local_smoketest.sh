@@ -24,6 +24,11 @@ MAX_ITEMS="${MAX_ITEMS:-200}"
 RUN_DATE="${RUN_DATE:-$(date +%F)-smoke$(date +%H%M%S)}"
 RUN_DIR="results/runs/${MODEL_ID}/${RUN_DATE}"
 
+# Optional: run meso-level analysis/ablations (can be compute-heavy).
+RUN_MESO="${RUN_MESO:-0}"
+MESO_MAX_ITEMS="${MESO_MAX_ITEMS:-${MAX_ITEMS}}"
+MESO_ALPHA="${MESO_ALPHA:-14.0}"
+
 # Optional: include CrowS-Pairs in the same run if the CSV exists.
 CROWS_PAIRS_PATH="${CROWS_PAIRS_PATH:-data/raw/crows_pairs.csv}"
 CROWS_MAX_ITEMS="${CROWS_MAX_ITEMS:-${MAX_ITEMS}}"
@@ -38,6 +43,9 @@ echo "SEED:       ${SEED}"
 echo "MAX_ITEMS:  ${MAX_ITEMS} (per category)"
 echo "RUN_DATE:   ${RUN_DATE}"
 echo "RUN_DIR:    ${RUN_DIR}"
+echo "RUN_MESO:   ${RUN_MESO}"
+echo "MESO_MAX_ITEMS: ${MESO_MAX_ITEMS}"
+echo "MESO_ALPHA: ${MESO_ALPHA}"
 echo "CROWS_PAIRS_PATH: ${CROWS_PAIRS_PATH}"
 echo "CROWS_MAX_ITEMS:  ${CROWS_MAX_ITEMS}"
 echo
@@ -111,6 +119,25 @@ echo
 echo "----- 7) Summary figure bundle -----"
 python scripts/generate_summary_figures.py \
   --run_dir "${RUN_DIR}"
+
+if [[ "${RUN_MESO}" == "1" ]]; then
+  echo
+  echo "----- 8) Meso directions + meso cluster ablations (optional) -----"
+  python scripts/compute_meso_directions.py \
+    --run_dir "${RUN_DIR}"
+
+  python scripts/ablate_meso_clusters.py \
+    --run_dir "${RUN_DIR}" \
+    --model_path "${MODEL_PATH}" \
+    --model_id "${MODEL_ID}" \
+    --device "${DEVICE}" \
+    --alpha "${MESO_ALPHA}" \
+    --max_items "${MESO_MAX_ITEMS}" \
+    --categories all
+
+  python scripts/analyze_meso_ablation.py \
+    --run_dir "${RUN_DIR}"
+fi
 
 echo
 echo "Smoke run complete. Outputs are under: ${RUN_DIR}"
