@@ -41,7 +41,7 @@ ENV/
 *.pfx
 
 # --- Model weights / checkpoints (large) ---
-models/
+/models/
 *.safetensors
 *.bin
 *.pt
@@ -49,6 +49,12 @@ models/
 *.ckpt
 *.gguf
 *.onnx
+
+# Keep the python package `src/models/` tracked, but ignore any weight folders
+# that may be placed inside it locally (e.g., src/models/llama2-7b/).
+src/models/*/
+!src/models/__init__.py
+!src/models/wrapper.py
 
 # --- Preprocessed datasets (can be huge; keep out of git) ---
 datasets/**
