@@ -27,6 +27,7 @@ import numpy as np
 import torch
 
 from src.analysis.bias_scores import compute_bias_score, bias_score_by_subgroup
+from src.data.bbq_loader import parse_categories
 from src.extraction.activations import format_prompt
 from src.interventions.direction_ablation import (
     apply_direction_ablation,
@@ -239,7 +240,7 @@ def main() -> None:
     run_dir = Path(args.run_dir)
     analysis_dir = ensure_dir(run_dir / "analysis")
     model_id = args.model_id or run_dir.parent.name
-    categories = [c.strip() for c in args.categories.split(",")]
+    categories = parse_categories(args.categories)
 
     log(f"{'='*60}")
     log(f"MESO-LEVEL CLUSTER ABLATION")
@@ -256,6 +257,13 @@ def main() -> None:
     # Load stimuli
     log("\nLoading stimuli...")
     cat_stimuli = _load_stimuli(run_dir, categories, args.max_items)
+    if not cat_stimuli:
+        raise RuntimeError(
+            "No stimuli found for any requested category. "
+            "Expected files under run_dir/stimuli like stimuli_so_YYYY-MM-DD*.json. "
+            "Make sure you ran scripts/run_extraction_pipeline.py for this run_dir first, "
+            "and that --categories is a valid list (or 'all')."
+        )
 
     # Load model
     log("\nLoading model...")
@@ -312,6 +320,8 @@ def main() -> None:
 
     # Validate hook on first available test item
     test_cat = next(iter(cat_stimuli.keys()))
+    if not cat_stimuli[test_cat]:
+        raise RuntimeError(f"No items loaded for category '{test_cat}'.")
     test_item = cat_stimuli[test_cat][0]
     test_dir = next(iter(cluster_dirs.values()))[target_layer]
     logit_diff = _validate_hook(model, tokenizer, get_layer_fn, test_dir,

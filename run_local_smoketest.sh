@@ -5,11 +5,13 @@ set -euo pipefail
 # Safe to re-run: uses a unique RUN_DATE by default to avoid overwriting/colliding.
 
 on_err() {
+  local status="$1"
+  local lineno="$2"
   echo
-  echo "ERROR: smoketest failed (exit=$?) at line $1"
+  echo "ERROR: smoketest failed (exit=${status}) at line ${lineno}"
   echo "Run dir (if created): ${RUN_DIR:-<unset>}"
 }
-trap 'on_err $LINENO' ERR
+trap 'on_err $? $LINENO' ERR
 
 # ----- Config (override via env vars) -----
 MODEL_ID="${MODEL_ID:-llama2-7b}"
