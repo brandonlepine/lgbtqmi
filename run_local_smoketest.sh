@@ -136,6 +136,10 @@ head_dim = hidden // n_heads
 print(f"{n_heads} {head_dim}")
 PY
 )
+  if [[ -z "${N_HEADS}" || -z "${HEAD_DIM}" ]]; then
+    echo "ERROR: Failed to infer N_HEADS/HEAD_DIM from model config."
+    exit 3
+  fi
   echo "  N_HEADS=${N_HEADS}  HEAD_DIM=${HEAD_DIM}"
 fi
 
