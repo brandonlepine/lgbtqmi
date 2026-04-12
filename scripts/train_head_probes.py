@@ -19,6 +19,7 @@ Usage:
 import argparse
 import json
 import sys
+from collections import Counter
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -161,73 +162,108 @@ def run_probes_for_model(
         stereo_matrix = np.full((n_layers, n_heads), 0.5, dtype=np.float32)
         results["stereo_matrix"] = stereo_matrix
 
-    # Probe C: SO sub-group classification
-    log("\n  === Probe C: SO sub-group classification ===")
-    so_stimuli = [s for s in stimuli if s["_category_short"] == "so"]
-    so_indices = [i for i, s in enumerate(stimuli) if s["_category_short"] == "so"]
+    # Probe C: Within-category subgroup classification (per-category)
+    log("\n  === Probe C: Within-category subgroup classification (all categories) ===")
+    # This is intentionally a *layer* probe (not head probe) to stay fast and avoid
+    # an O(n_categories * n_layers * n_heads) sweep.
+    MIN_SUBGROUP_ITEMS = 15
+    subgroup_layer_probes: dict[str, dict] = {}
 
-    if len(so_stimuli) >= 20:
-        so_finals = [finals[i] for i in so_indices]
-        mask_sg, y_sg, le_sg = build_subgroup_labels(so_stimuli)
-        log(f"  SO sub-groups: {list(le_sg.classes_)}")
+    # Imports are local to keep startup lean.
+    from sklearn.decomposition import PCA
+    from sklearn.linear_model import RidgeClassifier
+    from sklearn.model_selection import StratifiedKFold, cross_val_predict, cross_val_score
+    from sklearn.pipeline import Pipeline
+    from sklearn.preprocessing import LabelEncoder
 
-        # Build raw per-layer features (no PCA here to avoid CV leakage).
-        from sklearn.decomposition import PCA
-        from sklearn.linear_model import RidgeClassifier
-        from sklearn.model_selection import StratifiedKFold, cross_val_predict, cross_val_score
-        from sklearn.pipeline import Pipeline
+    def _safe_pca_k(n_samples: int, n_features: int, desired: int, n_splits: int) -> int:
+        # PCA runs inside CV folds; ensure k <= min(n_train, n_features) for all folds.
+        test_max = int(np.ceil(n_samples / max(n_splits, 2)))
+        n_train_min = max(n_samples - test_max, 1)
+        return int(max(1, min(desired, n_train_min, n_features)))
 
-        def _safe_pca_k(n_samples: int, n_features: int, desired: int, n_splits: int) -> int:
-            # PCA runs inside CV folds; ensure k <= min(n_train, n_features) for all folds.
-            test_max = int(np.ceil(n_samples / max(n_splits, 2)))
-            n_train_min = max(n_samples - test_max, 1)
-            return int(max(1, min(desired, n_train_min, n_features)))
+    cats_in_data = sorted({s.get("_category_short", "") for s in stimuli if s.get("_category_short")})
+    for cat in cats_in_data:
+        cat_stimuli = [s for s in stimuli if s.get("_category_short") == cat]
+        cat_indices = [i for i, s in enumerate(stimuli) if s.get("_category_short") == cat]
+        if len(cat_stimuli) < 20:
+            log(f"  {cat}: not enough items ({len(cat_stimuli)}), skipping")
+            continue
 
-        # Choose CV folds safely based on smallest class.
-        binc = np.bincount(y_sg, minlength=len(le_sg.classes_))
+        cat_finals = [finals[i] for i in cat_indices]
+
+        raw = []
+        for item in cat_stimuli:
+            groups = item.get("stereotyped_groups", [])
+            raw.append(groups[0].lower() if groups else "")
+
+        counts = Counter([r for r in raw if r])
+        eligible = sorted([g for g, n in counts.items() if n >= MIN_SUBGROUP_ITEMS])
+        if len(eligible) < 2:
+            log(
+                f"  {cat}: only {len(eligible)} subgroup(s) with ≥{MIN_SUBGROUP_ITEMS} items; skipping"
+            )
+            continue
+
+        finals_sg: list[np.ndarray] = []
+        labels_sg: list[str] = []
+        for item, f, r in zip(cat_stimuli, cat_finals, raw):
+            if r and r in eligible:
+                finals_sg.append(f)
+                labels_sg.append(r)
+
+        le = LabelEncoder()
+        y = le.fit_transform(labels_sg)
+
+        binc = np.bincount(y, minlength=len(le.classes_))
         min_per_class = int(binc.min()) if len(binc) else 0
         n_splits = int(min(5, max(2, min_per_class))) if min_per_class > 0 else 2
+        if n_splits < 2:
+            log(f"  {cat}: insufficient per-class counts for CV; skipping")
+            continue
         skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
 
-        # Find best layer for sub-group probe
-        best_sg_acc = 0.0
-        best_sg_layer = 0
+        # Find best layer (PCA inside folds to avoid leakage)
+        best_acc = 0.0
+        best_layer = 0
         for layer in range(n_layers):
-            X_raw = np.stack(
-                [so_finals[i][layer] for i, m in enumerate(mask_sg) if m],
-                axis=0,
-            )
-            desired = int(min(50, head_dim))
+            X_raw = np.stack([f[layer] for f in finals_sg], axis=0)
+            desired = 50
             k = _safe_pca_k(X_raw.shape[0], X_raw.shape[1], desired, n_splits)
-            pipe = Pipeline(
-                [("pca", PCA(n_components=k)), ("clf", RidgeClassifier(alpha=1.0))]
-            )
-            acc = float(np.mean(cross_val_score(pipe, X_raw, y_sg, cv=skf)))
-            if acc > best_sg_acc:
-                best_sg_acc = acc
-                best_sg_layer = layer
+            pipe = Pipeline([("pca", PCA(n_components=k)), ("clf", RidgeClassifier(alpha=1.0))])
+            acc = float(np.mean(cross_val_score(pipe, X_raw, y, cv=skf)))
+            if acc > best_acc:
+                best_acc = acc
+                best_layer = layer
 
-        log(f"  Best sub-group layer: {best_sg_layer} (acc={best_sg_acc:.3f})")
-        results["subgroup_best_layer"] = best_sg_layer
-        results["subgroup_best_accuracy"] = best_sg_acc
-        results["subgroup_classes"] = list(le_sg.classes_)
-
-        # Build confusion matrix at best layer
-        X_best_raw = np.stack(
-            [so_finals[i][best_sg_layer] for i, m in enumerate(mask_sg) if m],
-            axis=0,
-        )
-        desired = int(min(50, head_dim))
-        k = _safe_pca_k(X_best_raw.shape[0], X_best_raw.shape[1], desired, n_splits)
+        # Confusion at best layer
+        X_best = np.stack([f[best_layer] for f in finals_sg], axis=0)
+        desired = 50
+        k = _safe_pca_k(X_best.shape[0], X_best.shape[1], desired, n_splits)
         pipe = Pipeline([("pca", PCA(n_components=k)), ("clf", RidgeClassifier(alpha=1.0))])
-        y_pred = cross_val_predict(pipe, X_best_raw, y_sg, cv=skf)
-        conf = confusion_matrix(
-            y_sg, y_pred, labels=list(range(len(le_sg.classes_)))
-        )
-        results["subgroup_confusion"] = conf
-        results["subgroup_classes_list"] = list(le_sg.classes_)
-    else:
-        log(f"  Not enough SO items ({len(so_stimuli)}), skipping Probe C")
+        y_pred = cross_val_predict(pipe, X_best, y, cv=skf)
+        conf = confusion_matrix(y, y_pred, labels=list(range(len(le.classes_))))
+
+        log(f"  {cat}: subgroups={list(le.classes_)}")
+        log(f"  {cat}: best layer={best_layer} (acc={best_acc:.3f}), n={len(finals_sg)}")
+
+        subgroup_layer_probes[cat] = {
+            "n_items": int(len(finals_sg)),
+            "min_items_per_subgroup": int(MIN_SUBGROUP_ITEMS),
+            "classes": list(le.classes_),
+            "best_layer": int(best_layer),
+            "best_accuracy": float(best_acc),
+            "confusion": conf,
+        }
+
+        # Back-compat keys for SO (previous behavior)
+        if cat == "so":
+            results["subgroup_best_layer"] = int(best_layer)
+            results["subgroup_best_accuracy"] = float(best_acc)
+            results["subgroup_confusion"] = conf
+            results["subgroup_classes_list"] = list(le.classes_)
+
+    results["subgroup_layer_probes"] = subgroup_layer_probes
 
     return results
 
@@ -339,16 +375,33 @@ def main() -> None:
         )
         log(f"  Saved fig_11")
 
-    # Fig 13: Sub-group confusion matrix
-    if "subgroup_confusion" in base_results:
-        log("\n--- Fig 13: Sub-group probe confusion ---")
-        plot_confusion_matrix(
-            base_results["subgroup_confusion"],
-            base_results["subgroup_classes_list"],
-            path=str(fig_dir / "fig_13_subgroup_probe_confusion.png"),
-            title=f"SO sub-group confusion (Layer {base_results['subgroup_best_layer']}, {model_id})",
-        )
-        log(f"  Saved fig_13")
+    # Fig 13: Sub-group confusion matrix (per-category)
+    subgroup_probes = base_results.get("subgroup_layer_probes", {}) or {}
+    if subgroup_probes:
+        log("\n--- Fig 13: Sub-group probe confusion (per-category) ---")
+        for cat, info in sorted(subgroup_probes.items()):
+            conf = info["confusion"]
+            classes = info["classes"]
+            best_layer = info["best_layer"]
+            fname = f"fig_13_subgroup_probe_confusion_{cat}.png"
+            plot_confusion_matrix(
+                conf,
+                classes,
+                path=str(fig_dir / fname),
+                title=f"{cat} subgroup confusion (Layer {best_layer}, {model_id})",
+            )
+            log(f"  Saved {fname}")
+
+        # Keep legacy filename for SO if present (downstream scripts may expect it).
+        if "so" in subgroup_probes:
+            info = subgroup_probes["so"]
+            plot_confusion_matrix(
+                info["confusion"],
+                info["classes"],
+                path=str(fig_dir / "fig_13_subgroup_probe_confusion.png"),
+                title=f"SO sub-group confusion (Layer {info['best_layer']}, {model_id})",
+            )
+            log("  Saved fig_13_subgroup_probe_confusion.png")
 
     # Save probe results
     save_results = {
@@ -361,7 +414,19 @@ def main() -> None:
         "base_identity_max": float(base_results["identity_matrix"].max()),
         "base_stereo_max": float(base_results["stereo_matrix"].max()),
     }
+    if subgroup_probes:
+        save_results["subgroup_layer_probes"] = {
+            cat: {
+                "n_items": int(info["n_items"]),
+                "classes": list(info["classes"]),
+                "best_layer": int(info["best_layer"]),
+                "best_accuracy": float(info["best_accuracy"]),
+                "min_items_per_subgroup": int(info["min_items_per_subgroup"]),
+            }
+            for cat, info in sorted(subgroup_probes.items())
+        }
     if "subgroup_best_accuracy" in base_results:
+        # Legacy SO-only summary fields
         save_results["subgroup_best_layer"] = base_results["subgroup_best_layer"]
         save_results["subgroup_best_accuracy"] = base_results["subgroup_best_accuracy"]
     if chat_results:

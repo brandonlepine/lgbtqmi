@@ -150,7 +150,12 @@ def run_extraction(
     counts = {"stereotyped": 0, "non_stereotyped": 0, "unknown_selected": 0}
 
     for item in items:
-        idx = item.get("item_idx", 0)
+        try:
+            idx = int(item.get("item_idx", -1))
+        except Exception as exc:
+            raise RuntimeError(f"Invalid item_idx in stimuli item: {item.get('item_idx')}") from exc
+        if idx < 0:
+            raise RuntimeError("Missing/invalid item_idx in stimuli item (expected non-negative int).")
         out_path = output_dir / f"item_{idx:04d}.npz"
 
         if out_path.exists():

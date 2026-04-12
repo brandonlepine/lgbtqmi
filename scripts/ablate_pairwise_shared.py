@@ -56,8 +56,8 @@ def _load_model(model_path: str, device: str):
         wrapper = ModelWrapper.from_pretrained(model_path, device=device)
         return (wrapper.model, wrapper.tokenizer, wrapper.n_layers,
                 wrapper.hidden_dim, wrapper.get_layer)
-    except (ImportError, AttributeError):
-        pass
+    except (ImportError, AttributeError) as e:
+        log(f"ModelWrapper unavailable ({e}), falling back to direct loading")
 
     from transformers import AutoModelForCausalLM, AutoTokenizer
     tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=True)

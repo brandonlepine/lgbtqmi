@@ -1,7 +1,7 @@
 """SAE localization subpackage.
 
-This module provides a lightweight extraction + analysis pipeline for
-layer-range recommendations for SAE interventions.
+Stage 1: extraction + analysis for layer-range recommendations.
+Stage 2: SAE feature discovery, differential analysis, and bias decomposition.
 """
 
 __all__ = []

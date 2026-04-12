@@ -71,9 +71,8 @@ data/downloads/
 # Allow committing the small CrowS-Pairs CSV for portability.
 !data/raw/crows_pairs.csv
 
-# --- Run outputs (ignore heavy artifacts; keep summaries/analysis/figures commit-friendly) ---
-results/runs/**
-results/figures/latest
+# --- Run outputs (generated) ---
+results/**
 !results/.gitkeep
 
 # --- Alternative run root (some pipelines may use this) ---

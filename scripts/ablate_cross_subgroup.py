@@ -45,8 +45,8 @@ def _load_model(model_path: str, device: str):
         from src.models.wrapper import ModelWrapper
         w = ModelWrapper.from_pretrained(model_path, device=device)
         return w.model, w.tokenizer, w.n_layers, w.hidden_dim, w.get_layer
-    except (ImportError, AttributeError):
-        pass
+    except (ImportError, AttributeError) as e:
+        log(f"ModelWrapper unavailable ({e}), falling back to direct loading")
     from transformers import AutoModelForCausalLM, AutoTokenizer
     tok = AutoTokenizer.from_pretrained(model_path, use_fast=True)
     if not getattr(tok, "is_fast", False):

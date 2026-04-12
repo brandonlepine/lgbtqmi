@@ -82,12 +82,23 @@ def _load_model(model_path: str, device: str):
     # Validate hook output
     test_inp = tokenizer("test", return_tensors="pt").to(device)
     test_hs = {}
+    def _locate_hidden(output):
+        if isinstance(output, torch.Tensor):
+            return output
+        if isinstance(output, tuple):
+            for x in output:
+                if isinstance(x, torch.Tensor) and x.dim() == 3 and x.shape[-1] == hidden_dim:
+                    return x
+            return output[0] if output and isinstance(output[0], torch.Tensor) else None
+        return None
     def _th(module, args, output):
-        test_hs["out"] = output[0] if isinstance(output, tuple) else output
+        test_hs["out"] = _locate_hidden(output)
     h = inner[0].register_forward_hook(_th)
     with torch.no_grad():
         model(**test_inp)
     h.remove()
+    if test_hs.get("out") is None:
+        raise RuntimeError("Could not locate hidden state tensor in layer hook output for this architecture.")
     if test_hs["out"].shape[-1] != hidden_dim:
         raise RuntimeError(f"Hook output dim mismatch: {test_hs['out'].shape[-1]} vs {hidden_dim}")
 
@@ -200,6 +211,13 @@ def main() -> None:
         del model
         if args.device.startswith("cuda"):
             torch.cuda.empty_cache()
+    else:
+        act_base = run_dir / "activations"
+        if not act_base.exists():
+            raise SystemExit(
+                f"ERROR: --skip_extraction was set, but no activations directory exists at {act_base}. "
+                "Either run without --skip_extraction to generate activations, or point --run_date at an existing extraction."
+            )
 
     # Run analysis
     log(f"\n{'='*60}")
