@@ -165,8 +165,11 @@ def compute_4level_variance_decomposition(
     cluster_dirs: dict[str, np.ndarray],
     layer: int,
 ) -> dict[str, dict[str, float]]:
-    """4-level decomposition: shared / meso / within-cluster / category-residual."""
-    # Get shared direction (PC1)
+    """4-level decomposition: shared / meso / within-cluster / residual.
+
+    Important: we use a *cluster-level* within direction (one per cluster) so that
+    the residual term is not trivially zero for each category.
+    """
     sca = shared_component_analysis(cat_dirs, layer)
     shared_dir = sca["shared_direction"]
 
@@ -176,14 +179,33 @@ def compute_4level_variance_decomposition(
             continue
         cl_dir = cluster_dirs[cluster_name][layer]
 
-        # Meso direction = cluster direction projected out of shared
-        cl_proj_on_shared = np.dot(cl_dir, shared_dir) * shared_dir
-        meso_component = cl_dir - cl_proj_on_shared
-        meso_norm = np.linalg.norm(meso_component)
-        if meso_norm > 1e-8:
-            meso_unit = meso_component / meso_norm
+        # Meso direction = cluster direction with shared component removed
+        meso_component = cl_dir - float(np.dot(cl_dir, shared_dir)) * shared_dir
+        meso_norm = float(np.linalg.norm(meso_component))
+        meso_unit = (meso_component / meso_norm) if meso_norm > 1e-8 else None
+
+        # Within-cluster direction (one per cluster): average member residuals after removing shared+meso
+        within_vecs = []
+        for cat in members:
+            if cat not in cat_dirs:
+                continue
+            v = cat_dirs[cat][layer]
+            r = v - float(np.dot(v, shared_dir)) * shared_dir
+            if meso_unit is not None:
+                r = r - float(np.dot(r, meso_unit)) * meso_unit
+            rn = float(np.linalg.norm(r))
+            if rn > 1e-8:
+                within_vecs.append(r / rn)
+        if within_vecs:
+            within_raw = np.stack(within_vecs, axis=0).mean(axis=0)
+            # Orthogonalize within against shared and meso (for stable variance accounting)
+            within_raw = within_raw - float(np.dot(within_raw, shared_dir)) * shared_dir
+            if meso_unit is not None:
+                within_raw = within_raw - float(np.dot(within_raw, meso_unit)) * meso_unit
+            wn = float(np.linalg.norm(within_raw))
+            within_unit = (within_raw / wn) if wn > 1e-8 else None
         else:
-            meso_unit = np.zeros_like(shared_dir)
+            within_unit = None
 
         for cat in members:
             if cat not in cat_dirs:
@@ -191,30 +213,24 @@ def compute_4level_variance_decomposition(
             v = cat_dirs[cat][layer]
             total_var = float(np.dot(v, v))
             if total_var < 1e-12:
-                decomp[cat] = {"shared": 0, "meso": 0, "within_cluster": 0, "residual": 1.0}
+                decomp[cat] = {"shared": 0.0, "meso": 0.0, "within_cluster": 0.0, "residual": 1.0}
                 continue
 
             # Project onto shared
             shared_coeff = float(np.dot(v, shared_dir))
-            shared_var = shared_coeff ** 2
+            shared_var = shared_coeff**2
 
             # Project onto meso (orthogonal to shared by construction)
-            meso_coeff = float(np.dot(v, meso_unit))
-            meso_var = meso_coeff ** 2
+            if meso_unit is not None:
+                meso_coeff = float(np.dot(v, meso_unit))
+                meso_var = meso_coeff**2
+            else:
+                meso_var = 0.0
 
-            # Within-cluster: what's left of the cluster direction after shared+meso
-            # reconstructed from shared + meso
-            v_after_shared_meso = v - shared_coeff * shared_dir - meso_coeff * meso_unit
-
-            # Within-cluster residual = projection of v onto the within-cluster residual direction
-            # First compute raw within-cluster residual for this category
-            cat_proj_on_cluster = np.dot(v, cl_dir) * cl_dir
-            cat_within_raw = v - cat_proj_on_cluster
-            cat_within_norm = np.linalg.norm(cat_within_raw)
-            if cat_within_norm > 1e-8:
-                cat_within_unit = cat_within_raw / cat_within_norm
-                within_coeff = float(np.dot(v, cat_within_unit))
-                within_var = within_coeff ** 2
+            # Project onto within-cluster direction (cluster-level, after orthogonalization)
+            if within_unit is not None:
+                within_coeff = float(np.dot(v, within_unit))
+                within_var = within_coeff**2
             else:
                 within_var = 0.0
 
@@ -236,7 +252,11 @@ def compute_reconstruction_error(
     cat_dirs: dict[str, np.ndarray],
     cluster_dirs: dict[str, np.ndarray],
 ) -> dict[str, np.ndarray]:
-    """Measure reconstruction error per category per layer."""
+    """Measure reconstruction error per category per layer.
+
+    Reconstruction uses the 3 basis vectors: shared_dir (global), meso_dir (per cluster),
+    within_dir (per cluster). Residual = what remains after projecting onto those.
+    """
     n_layers = next(iter(cat_dirs.values())).shape[0]
     errors: dict[str, np.ndarray] = {}
 
@@ -253,15 +273,41 @@ def compute_reconstruction_error(
                 cl = cluster_dirs[cluster_name][layer]
                 v = cat_dirs[cat][layer]
 
-                # Reconstruct: project onto shared, cluster, and residual
-                shared_proj = np.dot(v, shared) * shared
-                cl_proj = np.dot(v, cl) * cl
-                residual = v - shared_proj - cl_proj
-                # The "reconstructed" includes shared + cluster + residual = v by construction
-                # So error should be ~0. The real question is whether shared+meso+within spans v.
-                # Reconstruction = shared_proj + meso_component_proj + within_proj + residual_proj
-                reconstructed = shared_proj + cl_proj + (v - shared_proj - cl_proj)
-                errs[layer] = float(np.linalg.norm(v - reconstructed))
+                # Meso basis: cluster direction with shared component removed
+                meso = cl - float(np.dot(cl, shared)) * shared
+                mn = float(np.linalg.norm(meso))
+                meso_u = (meso / mn) if mn > 1e-8 else None
+
+                # Within basis (cluster-level): average member residuals after removing shared+meso
+                within_vecs = []
+                for m in members:
+                    if m not in cat_dirs:
+                        continue
+                    vm = cat_dirs[m][layer]
+                    r = vm - float(np.dot(vm, shared)) * shared
+                    if meso_u is not None:
+                        r = r - float(np.dot(r, meso_u)) * meso_u
+                    rn = float(np.linalg.norm(r))
+                    if rn > 1e-8:
+                        within_vecs.append(r / rn)
+                if within_vecs:
+                    within = np.stack(within_vecs, axis=0).mean(axis=0)
+                    within = within - float(np.dot(within, shared)) * shared
+                    if meso_u is not None:
+                        within = within - float(np.dot(within, meso_u)) * meso_u
+                    wn = float(np.linalg.norm(within))
+                    within_u = (within / wn) if wn > 1e-8 else None
+                else:
+                    within_u = None
+
+                # Project sequentially onto (shared, meso, within) (shared and meso are orth; within was orthogonalized)
+                resid = v.copy()
+                resid = resid - float(np.dot(resid, shared)) * shared
+                if meso_u is not None:
+                    resid = resid - float(np.dot(resid, meso_u)) * meso_u
+                if within_u is not None:
+                    resid = resid - float(np.dot(resid, within_u)) * within_u
+                errs[layer] = float(np.linalg.norm(resid))
 
             errors[cat] = errs
     return errors
@@ -526,9 +572,18 @@ def main() -> None:
     # Step 3: Within-cluster residuals
     log("\n--- Step 3: Within-cluster residuals ---")
     within_residuals = compute_within_cluster_residuals(cat_dirs, cluster_dirs)
-    for cat, res in within_residuals.items():
-        norm_mid = float(np.linalg.norm(res[mid_layer]))
-        log(f"  {CATEGORY_LABELS.get(cat, cat)} within-cluster residual norm: {norm_mid:.4f}")
+    # Report the *raw* (unnormalized) residual magnitude at mid-layer for interpretability.
+    for cname, members in CLUSTERS.items():
+        if cname not in cluster_dirs:
+            continue
+        cl = cluster_dirs[cname][mid_layer]
+        for cat in members:
+            if cat not in cat_dirs:
+                continue
+            v = cat_dirs[cat][mid_layer]
+            raw = v - float(np.dot(v, cl)) * cl
+            raw_norm = float(np.linalg.norm(raw))
+            log(f"  {CATEGORY_LABELS.get(cat, cat)} raw residual ||v - proj_cluster(v)||: {raw_norm:.4f}")
 
     # Step 4: 4-level variance decomposition
     log("\n--- Step 4: Variance decomposition ---")
