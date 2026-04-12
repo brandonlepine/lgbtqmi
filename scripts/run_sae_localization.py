@@ -50,6 +50,11 @@ def _load_model(model_path: str, device: str):
 
     from transformers import AutoModelForCausalLM, AutoTokenizer
     tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=True)
+    if not getattr(tokenizer, "is_fast", False):
+        raise RuntimeError(
+            "Tokenizer is not fast; offset mapping is required by the broader pipeline. "
+            "Use a model with a fast tokenizer or ensure the fast tokenizer is available."
+        )
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     dtype = torch.float32 if device == "cpu" else torch.float16
@@ -100,6 +105,15 @@ def _load_stimuli(cat: str) -> list[dict] | None:
     with open(files[-1]) as f:
         return json.load(f)
 
+def _available_categories(categories: list[str]) -> tuple[list[str], list[str]]:
+    """Return (available, missing) based on presence of processed stimuli JSON files."""
+    avail: list[str] = []
+    missing: list[str] = []
+    for cat in categories:
+        files = sorted(Path("data/processed").glob(f"stimuli_{cat}_*.json"))
+        (avail if files else missing).append(cat)
+    return avail, missing
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="SAE layer localization pipeline.")
@@ -131,6 +145,18 @@ def main() -> None:
         log(f"Max items per category: {args.max_items}")
 
     if not args.skip_extraction:
+        available, missing = _available_categories(categories)
+        if missing:
+            log(f"\nNOTE: Missing processed stimuli for: {missing}")
+            log("Run this first (no model load):")
+            log("  python scripts/prepare_stimuli.py --categories all")
+        if not available:
+            raise SystemExit(
+                "ERROR: No processed stimuli found for any requested category under data/processed/. "
+                "Run: python scripts/prepare_stimuli.py --categories all"
+            )
+        categories = available
+
         # Load model once
         log(f"\n--- Loading model ---")
         t0 = time.time()
