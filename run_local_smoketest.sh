@@ -30,6 +30,13 @@ RUN_MESO="${RUN_MESO:-0}"
 MESO_MAX_ITEMS="${MESO_MAX_ITEMS:-${MAX_ITEMS}}"
 MESO_ALPHA="${MESO_ALPHA:-14.0}"
 
+# Optional: run pairwise shared-direction interventions (additive; can be compute-heavy).
+# Default: if you enabled RUN_MESO, also run pairwise unless explicitly disabled.
+RUN_PAIRWISE="${RUN_PAIRWISE:-${RUN_MESO}}"
+PAIRWISE_THRESHOLD="${PAIRWISE_THRESHOLD:-0.4}"
+PAIRWISE_MAX_PAIRS="${PAIRWISE_MAX_PAIRS:-}"
+PAIRWISE_ALPHA="${PAIRWISE_ALPHA:-14.0}"
+
 # Optional: include CrowS-Pairs in the same run if the CSV exists.
 CROWS_PAIRS_PATH="${CROWS_PAIRS_PATH:-data/raw/crows_pairs.csv}"
 CROWS_MAX_ITEMS="${CROWS_MAX_ITEMS:-${MAX_ITEMS}}"
@@ -65,6 +72,10 @@ echo "RUN_DIR:    ${RUN_DIR}"
 echo "RUN_MESO:   ${RUN_MESO}"
 echo "MESO_MAX_ITEMS: ${MESO_MAX_ITEMS:-<none>}"
 echo "MESO_ALPHA: ${MESO_ALPHA}"
+echo "RUN_PAIRWISE: ${RUN_PAIRWISE}"
+echo "PAIRWISE_THRESHOLD: ${PAIRWISE_THRESHOLD}"
+echo "PAIRWISE_MAX_PAIRS: ${PAIRWISE_MAX_PAIRS:-<none>}"
+echo "PAIRWISE_ALPHA: ${PAIRWISE_ALPHA}"
 echo "CROWS_PAIRS_PATH: ${CROWS_PAIRS_PATH}"
 echo "CROWS_MAX_ITEMS:  ${CROWS_MAX_ITEMS:-<none>}"
 echo
@@ -155,6 +166,32 @@ if [[ "${RUN_MESO}" == "1" ]]; then
     --categories all
 
   python scripts/analyze_meso_ablation.py \
+    --run_dir "${RUN_DIR}"
+fi
+
+if [[ "${RUN_PAIRWISE}" == "1" ]]; then
+  echo
+  echo "----- 9) Pairwise shared-direction extraction + ablation (optional) -----"
+  python scripts/extract_pairwise_shared.py \
+    --run_dir "${RUN_DIR}" \
+    --threshold "${PAIRWISE_THRESHOLD}"
+
+  PAIRWISE_MAX_PAIRS_ARGS=()
+  if [[ -n "${PAIRWISE_MAX_PAIRS}" ]]; then
+    PAIRWISE_MAX_PAIRS_ARGS=(--max_pairs "${PAIRWISE_MAX_PAIRS}")
+  fi
+
+  python scripts/ablate_pairwise_shared.py \
+    --run_dir "${RUN_DIR}" \
+    --model_path "${MODEL_PATH}" \
+    --model_id "${MODEL_ID}" \
+    --device "${DEVICE}" \
+    --alpha "${PAIRWISE_ALPHA}" \
+    "${MAX_ITEMS_ARGS[@]}" \
+    "${PAIRWISE_MAX_PAIRS_ARGS[@]}" \
+    --categories all
+
+  python scripts/analyze_pairwise_ablation.py \
     --run_dir "${RUN_DIR}"
 fi
 
