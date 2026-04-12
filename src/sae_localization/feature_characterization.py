@@ -136,7 +136,7 @@ def _co_activation(
         if other_col.std() < 1e-10:
             continue
         corr = float(np.corrcoef(target_col, other_col)[0, 1])
-        results.append({"feature_idx": other, "correlation": corr})
+        results.append({"feature_idx": int(other), "correlation": corr})
 
     results.sort(key=lambda x: abs(x["correlation"]), reverse=True)
     return results[:top_k]

@@ -119,16 +119,30 @@ class SAEWrapper:
         # We need to figure out the sub-directory name.  Download the full
         # repo (filtered) and scan.
         log(f"Downloading SAE from {repo_id} (layer {layer}, {expansion}x) ...")
+        patterns = [
+            f"*L{layer}{site}-{expansion}x*/hyperparams.json",
+            f"*L{layer}{site}-{expansion}x*/checkpoints/final.safetensors",
+            f"*L{layer}{site}-{expansion}x*/lm_config.json",
+        ]
         local = Path(
             snapshot_download(
                 repo_id,
-                allow_patterns=[
-                    f"*L{layer}{site}-{expansion}x*/hyperparams.json",
-                    f"*L{layer}{site}-{expansion}x*/checkpoints/final.safetensors",
-                    f"*L{layer}{site}-{expansion}x*/lm_config.json",
-                ],
+                allow_patterns=patterns,
             )
         )
+        # Fail-fast if the expected files weren't pulled (e.g., wrong repo/expansion/layer).
+        has_match = False
+        for pat in patterns:
+            if list(local.glob(pat)):
+                has_match = True
+                break
+        if not has_match:
+            raise FileNotFoundError(
+                "Downloaded SAE snapshot did not contain expected files for "
+                f"repo_id={repo_id} layer={layer} site={site} expansion={expansion}x. "
+                f"Tried allow_patterns={patterns}. "
+                "Double-check --sae_source/--sae_expansion/--sae_layers and that the repo contains that layer."
+            )
         self._load_local(local, layer, site, expansion)
 
     def _load_safetensors_dir(self, sae_dir: Path) -> None:
@@ -137,6 +151,7 @@ class SAEWrapper:
 
         # --- hyperparams ---
         hp_path = sae_dir / "hyperparams.json"
+        hp: dict = {}
         if hp_path.exists():
             with open(hp_path) as f:
                 hp = json.load(f)
@@ -177,17 +192,40 @@ class SAEWrapper:
 
         weights = load_file(str(st_path), device=self._device)
 
-        self._W_enc = weights["W_E"]  # (d_model, d_sae)
-        self._b_enc = weights["b_E"]  # (d_sae,)
-        self._W_dec = weights["W_D"]  # (d_sae, d_model)
-        self._b_dec = weights["b_D"]  # (d_model,)
+        # Support multiple naming conventions:
+        #   Llama Scope:  encoder.weight (d_sae, d_model), decoder.weight (d_model, d_sae)
+        #   lm-saes v1:   W_E (d_model, d_sae), W_D (d_sae, d_model)
+        if "encoder.weight" in weights:
+            # Llama Scope format — encoder is (d_sae, d_model)
+            self._W_enc = weights["encoder.weight"].T  # → (d_model, d_sae)
+            self._b_enc = weights["encoder.bias"]  # (d_sae,)
+            self._W_dec = weights["decoder.weight"].T  # → (d_sae, d_model)
+            self._b_dec = weights["decoder.bias"]  # (d_model,)
+        elif "W_E" in weights:
+            # lm-saes v1 format
+            self._W_enc = weights["W_E"]  # (d_model, d_sae)
+            self._b_enc = weights["b_E"]  # (d_sae,)
+            self._W_dec = weights["W_D"]  # (d_sae, d_model)
+            self._b_dec = weights["b_D"]  # (d_model,)
+        else:
+            raise KeyError(
+                f"Unrecognised weight keys: {list(weights.keys())}. "
+                "Expected 'encoder.weight' (Llama Scope) or 'W_E' (lm-saes)."
+            )
 
-        # JumpReLU threshold (stored as log)
+        # JumpReLU threshold
         log_thresh_key = "activation_function.log_jumprelu_threshold"
         if log_thresh_key in weights:
+            # Per-feature threshold stored as log
             self._threshold = torch.exp(weights[log_thresh_key])
+        elif hp_path.exists() and "jump_relu_threshold" in hp:
+            # Global scalar threshold from hyperparams.json
+            t_val = float(hp["jump_relu_threshold"])
+            self._threshold = torch.full(
+                (self._W_enc.shape[1],), t_val, device=self._device
+            )
+            log(f"  JumpReLU threshold (global): {t_val}")
         else:
-            # Fallback: no threshold → use zero (plain ReLU)
             log("  WARNING: no JumpReLU threshold found; using ReLU")
             self._threshold = torch.zeros(
                 self._W_enc.shape[1], device=self._device

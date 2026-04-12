@@ -263,12 +263,13 @@ def main() -> None:
         import torch
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
-        tokenizer = AutoTokenizer.from_pretrained(args.model_path)
+        tokenizer = AutoTokenizer.from_pretrained(args.model_path, use_fast=True)
         model = AutoModelForCausalLM.from_pretrained(
             args.model_path,
             dtype=torch.float16,
-            device_map=args.device,
         )
+        model.to(args.device)
+        model.eval()
         log("  Model loaded.")
 
     # Data dir for stimulus text
@@ -434,7 +435,7 @@ def _mean_jaccard(overlap: dict) -> float:
                 v = jaccard[c1].get(c2, 0)
                 if isinstance(v, (int, float)):
                     vals.append(v)
-    return float(np.mean(vals)) if vals else 0.0
+    return float(sum(vals) / len(vals)) if vals else 0.0
 
 
 if __name__ == "__main__":

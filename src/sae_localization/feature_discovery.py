@@ -150,7 +150,7 @@ def collect_sae_activations(
             # Encode through SAE
             with torch.no_grad():
                 act_tensor = torch.from_numpy(raw_activation).to(sae.device)
-                feat_acts = sae.encode(act_tensor).cpu().numpy()
+                feat_acts = sae.encode(act_tensor).float().cpu().numpy()
 
             rows_data.append(feat_acts)
             item_indices.append(meta.get("item_idx", -1))
