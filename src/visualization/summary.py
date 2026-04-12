@@ -243,8 +243,18 @@ def plot_generalization_summary(
     ax_b.axhline(0.5, color="gray", linewidth=1, linestyle="--", label="Chance")
     ax_b.set_xticks(range(len(bbq_cats)))
     ax_b.set_xticklabels(display_b, rotation=45, ha="right", fontsize=TICK_SIZE - 2)
-    ax_b.set_ylabel("CrowS-Pairs accuracy", fontsize=LABEL_SIZE - 1)
-    ax_b.set_ylim(0.3, 1.0)
+    ax_b.set_ylabel("CrowS-Pairs Probe B accuracy", fontsize=LABEL_SIZE - 1)
+    # Show below-chance values too (e.g., sign-flipped readouts)
+    ax_b.set_ylim(0.0, 1.0)
+    for rect, val in zip(bars, accs):
+        ax_b.text(
+            rect.get_x() + rect.get_width() / 2.0,
+            min(max(val, 0.0) + 0.02, 0.98),
+            f"{val:.2f}",
+            ha="center",
+            va="bottom",
+            fontsize=ANNOT_SIZE - 2,
+        )
     ax_b.legend(fontsize=TICK_SIZE - 1)
     ax_b.set_title("Cross-benchmark transfer", fontsize=TITLE_SIZE - 1)
     label_panel(ax_b, "B")
