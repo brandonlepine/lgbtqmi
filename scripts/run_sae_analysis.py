@@ -102,7 +102,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--data_dir",
         default=None,
-        help="BBQ data directory (for stimulus text in characterization)",
+        help="BBQ JSONL directory (for stimulus text in characterization), e.g. datasets/bbq/data",
     )
 
     # Scope
@@ -272,8 +272,18 @@ def main() -> None:
         model.eval()
         log("  Model loaded.")
 
-    # Data dir for stimulus text
-    data_dir = Path(args.data_dir) if args.data_dir else PROJECT_ROOT / "data" / "processed"
+    # Data dir for stimulus text (BBQ JSONL directory)
+    if args.data_dir:
+        data_dir = Path(args.data_dir)
+    else:
+        default_bbq = PROJECT_ROOT / "datasets" / "bbq" / "data"
+        data_dir = default_bbq if default_bbq.is_dir() else (PROJECT_ROOT / "data" / "processed")
+        if not default_bbq.is_dir():
+            log(
+                "WARNING: default BBQ data dir not found at datasets/bbq/data. "
+                "Stimulus text in characterization may be unavailable. "
+                "Fix by cloning BBQ to datasets/bbq or passing --data_dir datasets/bbq/data"
+            )
 
     summary: dict[str, any] = {
         "model_id": args.model_id,
