@@ -19,6 +19,10 @@ MODEL_PATH="${MODEL_PATH:-/Users/brandonlepine/Repositories/Research_Repositorie
 DEVICE="${DEVICE:-mps}"
 SEED="${SEED:-42}"
 
+# Optional: override head geometry. If unset, we infer from model config.
+N_HEADS="${N_HEADS:-}"
+HEAD_DIM="${HEAD_DIM:-}"
+
 # Optional per-category cap. If unset/empty, runs all items.
 MAX_ITEMS="${MAX_ITEMS:-}"
 
@@ -93,6 +97,45 @@ if [[ ! -d "${MODEL_PATH}" ]]; then
   exit 2
 fi
 
+# Infer head geometry once (used by probe scripts). This loads config only (no weights).
+if [[ -z "${N_HEADS}" || -z "${HEAD_DIM}" ]]; then
+  echo "Inferring N_HEADS/HEAD_DIM from model config..."
+  read -r N_HEADS HEAD_DIM < <(python - <<'PY'
+from __future__ import annotations
+import sys
+from pathlib import Path
+
+model_path = Path(sys.argv[1])
+try:
+    from transformers import AutoConfig
+except Exception as e:
+    raise SystemExit(f"ERROR: transformers not available to infer model config: {e}")
+
+cfg = AutoConfig.from_pretrained(str(model_path))
+
+def _get_int(*names: str) -> int | None:
+    for n in names:
+        v = getattr(cfg, n, None)
+        if isinstance(v, int) and v > 0:
+            return int(v)
+    return None
+
+n_heads = _get_int("num_attention_heads", "n_head", "n_heads")
+hidden = _get_int("hidden_size", "n_embd", "d_model")
+if n_heads is None or hidden is None:
+    raise SystemExit(
+        f"ERROR: could not infer n_heads/hidden_size from config class {type(cfg).__name__} "
+        f"(num_attention_heads={getattr(cfg,'num_attention_heads',None)}, hidden_size={getattr(cfg,'hidden_size',None)})"
+    )
+if hidden % n_heads != 0:
+    raise SystemExit(f"ERROR: hidden_size {hidden} not divisible by n_heads {n_heads}")
+head_dim = hidden // n_heads
+print(f"{n_heads} {head_dim}")
+PY
+"${MODEL_PATH}")
+  echo "  N_HEADS=${N_HEADS}  HEAD_DIM=${HEAD_DIM}"
+fi
+
 # Optional: install deps if requested
 if [[ "${INSTALL_DEPS:-0}" == "1" ]]; then
   echo "Installing dependencies from requirements.txt..."
@@ -126,12 +169,11 @@ python scripts/analyze_cross_category.py \
 
 echo
 echo "----- 4) Head probes (uses attn_pre_o_proj_final) -----"
-# Llama2-7b: n_heads=32, head_dim=128
 python scripts/train_head_probes.py \
   --run_dir "${RUN_DIR}" \
   --categories all \
-  --n_heads 32 \
-  --head_dim 128 \
+  --n_heads "${N_HEADS}" \
+  --head_dim "${HEAD_DIM}" \
   "${MAX_ITEMS_ARGS[@]}"
 
 echo
@@ -139,8 +181,8 @@ echo "----- 5) Probe generalization figs/results -----"
 python scripts/analyze_probe_generalization.py \
   --run_dir "${RUN_DIR}" \
   --categories all \
-  --n_heads 32 \
-  --head_dim 128 \
+  --n_heads "${N_HEADS}" \
+  --head_dim "${HEAD_DIM}" \
   "${MAX_ITEMS_ARGS[@]}"
 
 echo
@@ -224,8 +266,8 @@ if [[ "${RUN_SUBGROUP}" == "1" ]]; then
   python scripts/train_subgroup_probes.py \
     --run_dir "${RUN_DIR}" \
     --categories all \
-    --n_heads 32 \
-    --head_dim 128 \
+    --n_heads "${N_HEADS}" \
+    --head_dim "${HEAD_DIM}" \
     "${SUBGROUP_MAX_ITEMS_ARGS[@]}"
 
   python scripts/ablate_cross_subgroup.py \
