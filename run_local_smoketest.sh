@@ -100,12 +100,15 @@ fi
 # Infer head geometry once (used by probe scripts). This loads config only (no weights).
 if [[ -z "${N_HEADS}" || -z "${HEAD_DIM}" ]]; then
   echo "Inferring N_HEADS/HEAD_DIM from model config..."
-  read -r N_HEADS HEAD_DIM < <(python - <<'PY'
+  read -r N_HEADS HEAD_DIM < <(MODEL_PATH="${MODEL_PATH}" python - <<'PY'
 from __future__ import annotations
-import sys
+import os
 from pathlib import Path
 
-model_path = Path(sys.argv[1])
+mp = os.environ.get("MODEL_PATH", "")
+if not mp:
+    raise SystemExit("ERROR: MODEL_PATH env var not set for head-geometry inference")
+model_path = Path(mp)
 try:
     from transformers import AutoConfig
 except Exception as e:
@@ -132,7 +135,7 @@ if hidden % n_heads != 0:
 head_dim = hidden // n_heads
 print(f"{n_heads} {head_dim}")
 PY
-"${MODEL_PATH}")
+)
   echo "  N_HEADS=${N_HEADS}  HEAD_DIM=${HEAD_DIM}"
 fi
 
