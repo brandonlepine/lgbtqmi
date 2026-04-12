@@ -37,6 +37,11 @@ PAIRWISE_THRESHOLD="${PAIRWISE_THRESHOLD:-0.4}"
 PAIRWISE_MAX_PAIRS="${PAIRWISE_MAX_PAIRS:-}"
 PAIRWISE_ALPHA="${PAIRWISE_ALPHA:-14.0}"
 
+# Optional: run subgroup-level pipeline (directions + fragmentation + probes + ablation + summary).
+RUN_SUBGROUP="${RUN_SUBGROUP:-0}"
+SUBGROUP_MAX_ITEMS="${SUBGROUP_MAX_ITEMS:-${MAX_ITEMS}}"
+SUBGROUP_ALPHA="${SUBGROUP_ALPHA:-14.0}"
+
 # Optional: include CrowS-Pairs in the same run if the CSV exists.
 CROWS_PAIRS_PATH="${CROWS_PAIRS_PATH:-data/raw/crows_pairs.csv}"
 CROWS_MAX_ITEMS="${CROWS_MAX_ITEMS:-${MAX_ITEMS}}"
@@ -76,6 +81,9 @@ echo "RUN_PAIRWISE: ${RUN_PAIRWISE}"
 echo "PAIRWISE_THRESHOLD: ${PAIRWISE_THRESHOLD}"
 echo "PAIRWISE_MAX_PAIRS: ${PAIRWISE_MAX_PAIRS:-<none>}"
 echo "PAIRWISE_ALPHA: ${PAIRWISE_ALPHA}"
+echo "RUN_SUBGROUP: ${RUN_SUBGROUP}"
+echo "SUBGROUP_MAX_ITEMS: ${SUBGROUP_MAX_ITEMS:-<none>}"
+echo "SUBGROUP_ALPHA: ${SUBGROUP_ALPHA}"
 echo "CROWS_PAIRS_PATH: ${CROWS_PAIRS_PATH}"
 echo "CROWS_MAX_ITEMS:  ${CROWS_MAX_ITEMS:-<none>}"
 echo
@@ -192,6 +200,44 @@ if [[ "${RUN_PAIRWISE}" == "1" ]]; then
     --categories all
 
   python scripts/analyze_pairwise_ablation.py \
+    --run_dir "${RUN_DIR}"
+fi
+
+if [[ "${RUN_SUBGROUP}" == "1" ]]; then
+  echo
+  echo "----- 10) Subgroup directions + fragmentation + probes + cross-subgroup ablations (optional) -----"
+
+  SUBGROUP_MAX_ITEMS_ARGS=()
+  if [[ -n "${SUBGROUP_MAX_ITEMS}" ]]; then
+    SUBGROUP_MAX_ITEMS_ARGS=(--max_items "${SUBGROUP_MAX_ITEMS}")
+  fi
+
+  python scripts/compute_subgroup_directions.py \
+    --run_dir "${RUN_DIR}" \
+    --categories all \
+    "${SUBGROUP_MAX_ITEMS_ARGS[@]}"
+
+  python scripts/analyze_subgroup_fragmentation.py \
+    --run_dir "${RUN_DIR}"
+
+  # NOTE: you must pass the model's n_heads/head_dim for probe slicing
+  python scripts/train_subgroup_probes.py \
+    --run_dir "${RUN_DIR}" \
+    --categories all \
+    --n_heads 32 \
+    --head_dim 128 \
+    "${SUBGROUP_MAX_ITEMS_ARGS[@]}"
+
+  python scripts/ablate_cross_subgroup.py \
+    --run_dir "${RUN_DIR}" \
+    --model_path "${MODEL_PATH}" \
+    --model_id "${MODEL_ID}" \
+    --device "${DEVICE}" \
+    --alpha "${SUBGROUP_ALPHA}" \
+    "${SUBGROUP_MAX_ITEMS_ARGS[@]}" \
+    --categories all
+
+  python scripts/analyze_subgroup_results.py \
     --run_dir "${RUN_DIR}"
 fi
 
