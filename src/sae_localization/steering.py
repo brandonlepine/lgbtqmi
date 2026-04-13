@@ -184,16 +184,30 @@ class SAESteerer:
     # ------------------------------------------------------------------
 
     def _make_steering_hook(
-        self, steering_vec: torch.Tensor,
+        self,
+        steering_vec: torch.Tensor,
+        *,
+        scope: str = "last",
     ) -> Callable:
-        """Return a hook function that adds steering_vec to the last-token residual."""
+        """Return a hook function that adds steering_vec to the residual stream.
+
+        scope:
+          - "last": only last token position (good for BBQ letter selection)
+          - "all": all token positions (required for sequence log-prob scoring)
+        """
+        if scope not in ("last", "all"):
+            raise ValueError(f"Unknown steering hook scope: {scope!r}")
         def hook_fn(module: Any, args: Any, output: Any) -> Any:
             hidden, tup_idx = _locate_hidden_in_output(output, self.wrapper.hidden_dim)
 
             seq_len = hidden.shape[1]
             # Modify last token position (clone to avoid mutating shared buffers)
             hidden2 = hidden.clone()
-            hidden2[:, seq_len - 1, :] = hidden2[:, seq_len - 1, :] + steering_vec.to(hidden.dtype)
+            vec = steering_vec.to(hidden.dtype)
+            if scope == "all":
+                hidden2 = hidden2 + vec.view(1, 1, -1)
+            else:
+                hidden2[:, seq_len - 1, :] = hidden2[:, seq_len - 1, :] + vec
 
             if tup_idx is None:
                 return hidden2
@@ -201,9 +215,9 @@ class SAESteerer:
 
         return hook_fn
 
-    def _install_hook(self, steering_vec: torch.Tensor) -> None:
+    def _install_hook(self, steering_vec: torch.Tensor, *, scope: str = "last") -> None:
         """Register the steering hook on self.layer."""
-        hook_fn = self._make_steering_hook(steering_vec)
+        hook_fn = self._make_steering_hook(steering_vec, scope=scope)
         handle, counter = self.wrapper.register_residual_hook(
             self.layer, hook_fn, name="sae_steering"
         )
@@ -240,7 +254,7 @@ class SAESteerer:
         from src.utils.answers import best_choice_from_logits
 
         self.clear_hooks()
-        self._install_hook(steering_vec)
+        self._install_hook(steering_vec, scope="last")
 
         tokenizer = self.wrapper.tokenizer
         inputs = tokenizer(prompt, return_tensors="pt").to(self.wrapper.device)
@@ -449,7 +463,9 @@ class SAESteerer:
     ) -> float:
         """Compute mean per-token log-prob under steering."""
         self.clear_hooks()
-        self._install_hook(steering_vec)
+        # For sequence scoring, we must steer *all* positions. If we only steer the
+        # last token, compute_log_prob() excludes that position and the score won't change.
+        self._install_hook(steering_vec, scope="all")
 
         result = self.compute_log_prob(text)
         self.clear_hooks()
