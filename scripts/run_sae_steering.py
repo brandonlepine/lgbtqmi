@@ -415,6 +415,11 @@ def main() -> None:
                     from src.data.mmlu_loader import load_mmlu_items
                     mmlu_items = load_mmlu_items(args.mmlu_path, max_items=args.max_items)
                     log(f"  Loaded {len(mmlu_items)} MMLU items")
+                    if not mmlu_items:
+                        raise SystemExit(
+                            f"ERROR: loaded 0 MMLU items from {args.mmlu_path}. "
+                            "This usually means the path is wrong or the downloaded dataset format is unsupported."
+                        )
                 except Exception as exc:
                     raise SystemExit(f"ERROR: failed to load MMLU from {args.mmlu_path}: {exc}") from exc
 
@@ -424,6 +429,13 @@ def main() -> None:
                     from src.data.medqa_loader import load_medqa_items
                     medqa_items = load_medqa_items(args.medqa_path, max_items=args.max_items)
                     log(f"  Loaded {len(medqa_items)} MedQA items")
+                    if not medqa_items:
+                        raise SystemExit(
+                            f"ERROR: loaded 0 MedQA items from {args.medqa_path}. "
+                            "Expected JSONL schema like: "
+                            "{question: str, options: {A..E: str}, answer_idx: 'A'..'E'} "
+                            "(or parquet with equivalent fields)."
+                        )
                 except Exception as exc:
                     raise SystemExit(f"ERROR: failed to load MedQA from {args.medqa_path}: {exc}") from exc
 
