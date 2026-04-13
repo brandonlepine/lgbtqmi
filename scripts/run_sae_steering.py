@@ -420,8 +420,12 @@ def main() -> None:
 
             if args.medqa_path and Path(args.medqa_path).is_dir():
                 log("  Loading MedQA items ...")
-                # TODO: implement MedQA loading
-                log("  MedQA loading not yet implemented — skipping")
+                try:
+                    from src.data.medqa_loader import load_medqa_items
+                    medqa_items = load_medqa_items(args.medqa_path, max_items=args.max_items)
+                    log(f"  Loaded {len(medqa_items)} MedQA items")
+                except Exception as exc:
+                    raise SystemExit(f"ERROR: failed to load MedQA from {args.medqa_path}: {exc}") from exc
 
             if mmlu_items or medqa_items:
                 exp_e = experiment_e_side_effects(
