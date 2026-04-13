@@ -71,11 +71,40 @@ def _load_stimuli_text(
     return items
 
 
+def _load_processed_stimuli(
+    processed_dir: Path, categories: list[str]
+) -> dict[int, dict[str, Any]]:
+    """Load standardized processed stimuli JSON, indexed by item_idx.
+
+    This is the preferred source for interpretability text because it matches the
+    exact prompt content used in extraction (shuffled answers, etc.).
+    """
+    items: dict[int, dict[str, Any]] = {}
+    for cat in categories:
+        files = sorted(processed_dir.glob(f"stimuli_{cat}_*.json"))
+        if not files:
+            continue
+        try:
+            with open(files[-1]) as f:
+                stimuli = json.load(f)
+            for it in stimuli:
+                try:
+                    idx = int(it.get("item_idx", -1))
+                except Exception:
+                    continue
+                if idx >= 0:
+                    items[idx] = it
+        except Exception as exc:
+            log(f"  WARNING: failed to load processed stimuli for {cat}: {exc}")
+    return items
+
+
 def _top_activating_items(
     feature_idx: int,
     sparse_mat: sp.csr_matrix,
     meta_list: list[dict[str, Any]],
     stimuli: dict[int, dict[str, Any]],
+    stage1_act_base: Path | None = None,
     top_k: int = 10,
 ) -> list[dict[str, Any]]:
     """Find the items where this feature activates most strongly."""
@@ -89,13 +118,31 @@ def _top_activating_items(
         meta = meta_list[idx]
         item_idx = meta.get("item_idx", -1)
         stim = stimuli.get(item_idx, {})
+        model_answer = meta.get("model_answer", "") or ""
+
+        # Fallback: load model_answer from Stage-1 item metadata if available.
+        if (not model_answer) and stage1_act_base is not None:
+            cat_short = meta.get("category_short", "")
+            if cat_short:
+                p = stage1_act_base / str(cat_short) / f"item_{int(item_idx):04d}.npz"
+                try:
+                    import numpy as _np
+                    data = _np.load(p, allow_pickle=True)
+                    raw = data.get("metadata_json", None)
+                    if raw is not None:
+                        meta_str = raw.item() if getattr(raw, "shape", None) == () else str(raw)
+                        j = json.loads(meta_str)
+                        model_answer = j.get("model_answer", "") or model_answer
+                except Exception:
+                    pass
 
         results.append({
             "item_idx": item_idx,
             "category": meta.get("category", ""),
             "context": stim.get("context", ""),
             "question": stim.get("question", ""),
-            "model_answer": meta.get("model_answer", ""),
+            "answers": stim.get("answers", {}),
+            "model_answer": model_answer,
             "model_answer_role": meta.get("model_answer_role", ""),
             "is_stereotyped_response": meta.get("is_stereotyped_response", False),
             "activation_value": float(col[idx]),
@@ -193,6 +240,7 @@ def run_feature_characterization(
     target_layer: int,
     output_dir: Path,
     data_dir: Optional[Path] = None,
+    localization_dir: Optional[Path] = None,
     model: Any = None,
     tokenizer: Any = None,
 ) -> list[dict[str, Any]]:
@@ -222,11 +270,22 @@ def run_feature_characterization(
     reports_dir = ensure_dir(output_dir / "feature_reports")
     categories = list(cat_data.keys())
 
-    # Load stimuli text
+    # Load stimuli text (prefer processed stimuli JSON; fall back to raw BBQ JSONL if provided)
     stimuli: dict[int, dict[str, Any]] = {}
-    if data_dir is not None:
+    processed_dir = Path("data") / "processed"
+    if processed_dir.is_dir():
+        stimuli = _load_processed_stimuli(processed_dir, categories)
+        if stimuli:
+            log(f"  Loaded {len(stimuli)} processed stimulus texts from {processed_dir}")
+    if not stimuli and data_dir is not None:
         stimuli = _load_stimuli_text(data_dir, categories)
-        log(f"  Loaded {len(stimuli)} stimulus texts")
+        log(f"  Loaded {len(stimuli)} raw BBQ stimulus texts from {data_dir}")
+
+    stage1_act_base = None
+    if localization_dir is not None:
+        base = Path(localization_dir) / "activations"
+        if base.is_dir():
+            stage1_act_base = base
 
     # Pool all activations and metadata
     all_sparse: list[sp.csr_matrix] = []
@@ -243,6 +302,7 @@ def run_feature_characterization(
                 "model_answer_role": str(d["model_answer_roles"][i]),
                 "context_condition": str(d["context_conditions"][i]),
                 "category": str(d["categories_arr"][i]),
+                "category_short": str(cat),
                 "model_answer": "",  # not in saved metadata
             })
             all_groups.append(
@@ -338,7 +398,7 @@ def run_feature_characterization(
 
         # Top activating items
         top_items = _top_activating_items(
-            fid, pooled_mat, all_meta, stimuli
+            fid, pooled_mat, all_meta, stimuli, stage1_act_base=stage1_act_base
         )
         report["top_activating_items"] = top_items
         atomic_save_json(top_items, feat_dir / "top_activating_items.json")

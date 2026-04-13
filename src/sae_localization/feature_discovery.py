@@ -226,7 +226,10 @@ def load_sae_activations(
         sparse_path = feature_dir / cat / f"layer_{target_layer}.npz"
         meta_path = feature_dir / cat / f"layer_{target_layer}_meta.json"
         if not sparse_path.exists() or not meta_path.exists():
-            log(f"  Skipping {cat}: no saved activations for layer {target_layer}")
+            log(
+                f"  Skipping {cat}: no cached SAE feature_activations for layer {target_layer} yet "
+                f"(will encode after SAE loads)"
+            )
             continue
 
         sparse_mat = sp.load_npz(sparse_path)

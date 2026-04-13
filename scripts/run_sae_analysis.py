@@ -368,6 +368,7 @@ def main() -> None:
                 target_layer=layer,
                 output_dir=output_dir,
                 data_dir=data_dir,
+                localization_dir=loc_dir,
                 model=model,
                 tokenizer=tokenizer,
             )
