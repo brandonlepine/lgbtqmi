@@ -76,9 +76,26 @@ def fig_alpha_sweep(
     if not per_alpha:
         return
 
-    alphas = sorted(float(a) for a in per_alpha.keys())
-    correction = [per_alpha[str(a)].get("correction_rate", 0) for a in alphas]
-    degen = [per_alpha[str(a)].get("degeneration_rate", 0) for a in alphas]
+    # per_alpha keys may be "-50" or "-50.0" depending on how JSON was written.
+    alpha_keys = list(per_alpha.keys())
+    try:
+        alpha_keys_sorted = sorted(alpha_keys, key=lambda k: float(k))
+    except Exception:
+        # Fallback: stable order if keys are unexpected
+        alpha_keys_sorted = alpha_keys
+
+    alphas = []
+    correction = []
+    degen = []
+    for k in alpha_keys_sorted:
+        try:
+            a = float(k)
+        except Exception:
+            continue
+        d = per_alpha.get(k, {}) or {}
+        alphas.append(a)
+        correction.append(d.get("correction_rate", 0))
+        degen.append(d.get("degeneration_rate", 0))
 
     fig, ax = plt.subplots(figsize=(8, 5))
     ax.plot(alphas, correction, "o-", color=BLUE, label="Correction rate", markersize=6)
