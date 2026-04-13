@@ -476,8 +476,8 @@ def experiment_e_side_effects(
             correct = item.get("answer", "")
             subject = item.get("subject", "other")
 
-            baseline = steerer.evaluate_baseline(prompt)
-            steered = steerer.steer_and_evaluate(prompt, steering_vec)
+            baseline = steerer.evaluate_baseline_mcq(prompt, letters=("A", "B", "C", "D"))
+            steered = steerer.steer_and_evaluate(prompt, steering_vec, letters=("A", "B", "C", "D"))
 
             b_correct = int(baseline["model_answer"] == correct)
             s_correct = int(steered["model_answer"] == correct)

@@ -245,6 +245,8 @@ class SAESteerer:
         self,
         prompt: str,
         steering_vec: torch.Tensor,
+        *,
+        letters: tuple[str, ...] = ("A", "B", "C"),
     ) -> dict[str, Any]:
         """Run forward pass with steering and extract the model's answer.
 
@@ -267,7 +269,7 @@ class SAESteerer:
         self.clear_hooks()
 
         logits = outputs.logits[0, last_pos, :]
-        best_letter, letter_logits = best_choice_from_logits(logits, tokenizer)
+        best_letter, letter_logits = best_choice_from_logits(logits, tokenizer, letters=letters)
 
         # Top-5 tokens
         top5_vals, top5_idx = torch.topk(logits, 5)
@@ -312,6 +314,26 @@ class SAESteerer:
             "model_answer": best_letter or "",
             "answer_logits": letter_logits,
         }
+
+    def evaluate_baseline_mcq(
+        self,
+        prompt: str,
+        *,
+        letters: tuple[str, ...] = ("A", "B", "C"),
+    ) -> dict[str, Any]:
+        """Baseline answer extraction for arbitrary MCQ letter sets (e.g., A/B/C/D)."""
+        from src.utils.answers import best_choice_from_logits
+
+        self.clear_hooks()
+        tokenizer = self.wrapper.tokenizer
+        inputs = tokenizer(prompt, return_tensors="pt").to(self.wrapper.device)
+        seq_len = inputs["input_ids"].shape[1]
+        last_pos = seq_len - 1
+        with torch.no_grad():
+            outputs = self.wrapper.model(**inputs)
+        logits = outputs.logits[0, last_pos, :]
+        best_letter, letter_logits = best_choice_from_logits(logits, tokenizer, letters=letters)
+        return {"model_answer": best_letter or "", "answer_logits": letter_logits}
 
     # ------------------------------------------------------------------
     # Alpha sweep

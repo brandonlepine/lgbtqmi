@@ -411,8 +411,12 @@ def main() -> None:
 
             if args.mmlu_path and Path(args.mmlu_path).is_dir():
                 log("  Loading MMLU items ...")
-                # TODO: implement MMLU loading from standard format
-                log("  MMLU loading not yet implemented — skipping")
+                try:
+                    from src.data.mmlu_loader import load_mmlu_items
+                    mmlu_items = load_mmlu_items(args.mmlu_path, max_items=args.max_items)
+                    log(f"  Loaded {len(mmlu_items)} MMLU items")
+                except Exception as exc:
+                    raise SystemExit(f"ERROR: failed to load MMLU from {args.mmlu_path}: {exc}") from exc
 
             if args.medqa_path and Path(args.medqa_path).is_dir():
                 log("  Loading MedQA items ...")
