@@ -59,6 +59,13 @@ src/models/*/
 # --- Preprocessed datasets (can be huge; keep out of git) ---
 datasets/**
 !datasets/.gitkeep
+# Allow committing the (small) MedQA dataset folder.
+!datasets/medqa/
+!datasets/medqa/**
+# But keep OS junk out of that folder.
+datasets/medqa/**/.DS_Store
+datasets/medqa/**/.AppleDouble
+datasets/medqa/**/._*
 
 # --- Data (allow small inputs, ignore typical large subdirs) ---
 data/raw/*
