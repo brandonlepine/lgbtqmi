@@ -96,31 +96,42 @@ def _compute_rates(df: "pd.DataFrame", direction: str = "suppress") -> dict[str,
 
 
 def _select_optimal_alpha(
-    sweep_df: "pd.DataFrame", direction: str = "suppress", max_degen: float = 0.05,
+    sweep_df: "pd.DataFrame",
+    direction: str = "suppress",
+    max_degen: float = 0.05,
+    tie_tol: float = 0.005,
 ) -> float:
-    """Select the alpha with highest correction/corruption rate under degeneration constraint."""
+    """Select alpha under degeneration constraint.
+
+    Selection rule:
+    - maximize correction/corruption rate
+    - if multiple alphas are within `tie_tol` of the best rate, prefer the *smallest |alpha|*
+      (reduces risk of large off-target effects on other datasets).
+    """
     _require_pandas()
-    best_alpha = 0.0
-    best_rate = -1.0
+    alpha_rates: list[tuple[float, float]] = []
 
     for alpha in sweep_df["alpha"].unique():
         sub = sweep_df[sweep_df["alpha"] == alpha]
-        degen_rate = sub["degenerated"].mean()
+        degen_rate = float(sub["degenerated"].mean())
         if degen_rate > max_degen:
             continue
 
+        flipped_roles = sub.loc[sub["flipped"], "steered_role"]
         if direction == "suppress":
-            flipped_roles = sub.loc[sub["flipped"], "steered_role"]
-            rate = flipped_roles.isin(["non_stereotyped", "unknown"]).sum() / max(len(sub), 1)
+            rate = float(flipped_roles.isin(["non_stereotyped", "unknown"]).sum() / max(len(sub), 1))
         else:
-            flipped_roles = sub.loc[sub["flipped"], "steered_role"]
-            rate = flipped_roles.eq("stereotyped_target").sum() / max(len(sub), 1)
+            rate = float(flipped_roles.eq("stereotyped_target").sum() / max(len(sub), 1))
+        alpha_rates.append((float(alpha), rate))
 
-        if rate > best_rate:
-            best_rate = rate
-            best_alpha = alpha
+    if not alpha_rates:
+        return 0.0
 
-    return float(best_alpha)
+    best_rate = max(r for _, r in alpha_rates)
+    candidates = [(a, r) for a, r in alpha_rates if r >= (best_rate - tie_tol)]
+    # prefer smallest |alpha| among near-ties; if still tied, prefer higher rate
+    candidates.sort(key=lambda ar: (abs(ar[0]), -ar[1]))
+    return float(candidates[0][0])
 
 
 # ---------------------------------------------------------------------------
@@ -460,9 +471,16 @@ def experiment_e_side_effects(
         Pre-loaded items with expected fields.
     """
     _require_pandas()
-    from src.utils.answers import best_choice_from_logits
+    import pandas as pd  # type: ignore
 
     result: dict[str, Any] = {"experiment": "E"}
+
+    def _margin(letter_logits: dict[str, float]) -> float | None:
+        vals = [v for v in letter_logits.values() if v is not None]
+        if len(vals) < 2:
+            return None
+        vals2 = sorted([float(v) for v in vals], reverse=True)
+        return float(vals2[0] - vals2[1])
 
     # E1: MMLU
     if mmlu_items:
@@ -471,6 +489,7 @@ def experiment_e_side_effects(
         steered_correct = 0
         n_flipped = 0
         per_subject: dict[str, dict[str, int]] = {}
+        per_item_rows: list[dict[str, Any]] = []
 
         for i, item in enumerate(mmlu_items):
             prompt = _format_mmlu_item(item)
@@ -492,6 +511,21 @@ def experiment_e_side_effects(
             per_subject[subject]["steered"] += s_correct
             per_subject[subject]["total"] += 1
             per_subject[subject]["flipped"] += flipped
+
+            per_item_rows.append(
+                {
+                    "subject": subject,
+                    "question": item.get("question", ""),
+                    "correct": correct,
+                    "baseline_answer": baseline.get("model_answer", ""),
+                    "steered_answer": steered.get("model_answer", ""),
+                    "baseline_correct": b_correct,
+                    "steered_correct": s_correct,
+                    "flipped": flipped,
+                    "baseline_margin": _margin(baseline.get("answer_logits", {})),
+                    "steered_margin": _margin(steered.get("answer_logits", {})),
+                }
+            )
 
             if (i + 1) % 50 == 0:
                 log(f"    MMLU [{i + 1}/{len(mmlu_items)}]")
@@ -515,6 +549,7 @@ def experiment_e_side_effects(
                 for s, d in per_subject.items()
             },
         }
+        pd.DataFrame(per_item_rows).to_parquet(output_dir / "experiment_E_mmlu.parquet", index=False)
 
     # E2: MedQA
     if medqa_items:
@@ -526,6 +561,7 @@ def experiment_e_side_effects(
         demo_steered = 0
         n_demo = 0
         demo_flipped = 0
+        per_item_rows: list[dict[str, Any]] = []
 
         for i, item in enumerate(medqa_items):
             prompt = item.get("prompt", "")
@@ -549,6 +585,23 @@ def experiment_e_side_effects(
                 n_demo += 1
                 demo_flipped += flipped
 
+            first_line = (prompt.splitlines()[0] if prompt else "")[:240]
+            per_item_rows.append(
+                {
+                    "prompt_first_line": first_line,
+                    "correct": correct,
+                    "letters": "".join(letters),
+                    "is_demographic": bool(is_demo),
+                    "baseline_answer": baseline.get("model_answer", ""),
+                    "steered_answer": steered.get("model_answer", ""),
+                    "baseline_correct": b_correct,
+                    "steered_correct": s_correct,
+                    "flipped": flipped,
+                    "baseline_margin": _margin(baseline.get("answer_logits", {})),
+                    "steered_margin": _margin(steered.get("answer_logits", {})),
+                }
+            )
+
             if (i + 1) % 50 == 0:
                 log(f"    MedQA [{i + 1}/{len(medqa_items)}]")
 
@@ -567,6 +620,7 @@ def experiment_e_side_effects(
             "demographic_flip_rate": demo_flipped / max(n_demo, 1),
             "n_demographic_flipped": demo_flipped,
         }
+        pd.DataFrame(per_item_rows).to_parquet(output_dir / "experiment_E_medqa.parquet", index=False)
 
     atomic_save_json(result, output_dir / "experiment_E_side_effects.json")
     return result

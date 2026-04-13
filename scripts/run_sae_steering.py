@@ -78,6 +78,19 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--crows_pairs_path", default=None)
     p.add_argument("--mmlu_path", default=None)
     p.add_argument("--medqa_path", default=None)
+    p.add_argument(
+        "--e_alpha_agg",
+        default="median",
+        choices=["mean", "median"],
+        help="How to aggregate per-category optimal alphas into a single alpha for Experiment E.",
+    )
+    p.add_argument(
+        "--e_feature_top_k",
+        type=int,
+        default=50,
+        help="For Experiment E, take at most top-K pro-bias features per category (by |cohens_d|). "
+        "Reduces 'smearing' many weak features across unrelated contexts. Set <=0 to disable.",
+    )
 
     p.add_argument("--skip_figures", action="store_true")
     p.add_argument("--skip_individual", action="store_true",
@@ -398,7 +411,19 @@ def main() -> None:
         import torch
         all_pro_features = []
         for cat in valid_cats:
-            all_pro_features.extend(get_feature_set(per_cat_df, cat, direction="pro_bias"))
+            # Prefer strongest pro-bias features for this category to limit off-target effects.
+            dfc = per_cat_df[
+                (per_cat_df["category"] == cat)
+                & (per_cat_df["direction"] == "pro_bias")
+                & (per_cat_df["is_significant"] == True)  # noqa: E712
+            ].copy()
+            if not dfc.empty and args.e_feature_top_k and args.e_feature_top_k > 0:
+                dfc["abs_d"] = dfc["cohens_d"].abs()
+                dfc = dfc.sort_values("abs_d", ascending=False).head(int(args.e_feature_top_k))
+                feats = dfc["feature_idx"].astype(int).tolist()
+            else:
+                feats = get_feature_set(per_cat_df, cat, direction="pro_bias")
+            all_pro_features.extend(feats)
         all_pro_features = list(set(all_pro_features))
 
         if all_pro_features:
@@ -424,8 +449,19 @@ def main() -> None:
                     "Run with --experiments 'A,E' (or run A once so E can reuse cached results)."
                 )
 
-            mean_alpha = sum(optimal_alphas.values()) / max(len(optimal_alphas), 1)
-            composite_vec = steerer.get_composite_steering(all_pro_features, mean_alpha)
+            vals = list(optimal_alphas.values())
+            if args.e_alpha_agg == "median":
+                import numpy as np
+                agg_alpha = float(np.median(np.array(vals, dtype=float)))
+            else:
+                agg_alpha = float(sum(vals) / max(len(vals), 1))
+
+            composite_vec = steerer.get_composite_steering(all_pro_features, agg_alpha)
+            vec_norm = float(composite_vec.float().norm().detach().cpu())
+            log(
+                f"  Steering (E): alpha_{args.e_alpha_agg}={agg_alpha:.3f}  n_features={len(all_pro_features)}  "
+                f"||vec||={vec_norm:.3f}  scale_by_sqrt_n=True  layer={args.sae_layer}"
+            )
 
             # Load MMLU / MedQA if paths provided
             mmlu_items = None
@@ -466,6 +502,15 @@ def main() -> None:
                     steerer, composite_vec, mmlu_items, medqa_items,
                     ensure_dir(output_dir / "experiments"),
                 )
+                exp_e["steering"] = {
+                    "alpha_agg": str(args.e_alpha_agg),
+                    "alpha_value": float(agg_alpha),
+                    "n_features": int(len(all_pro_features)),
+                    "per_category_top_k": int(args.e_feature_top_k) if args.e_feature_top_k else None,
+                    "vector_norm": float(vec_norm),
+                    "scale_by_sqrt_n": True,
+                    "layer": int(args.sae_layer),
+                }
 
     # ---- Cross-subgroup transfer (for Figure 28) ----
     for cat in valid_cats:
