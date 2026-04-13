@@ -94,12 +94,40 @@ def _iter_parquet_items(path: Path) -> Iterable[dict[str, Any]]:
             "ensure rows are dict-like records; otherwise convert to a supported format."
         )
 
+    def _coerce_choices(x: Any) -> list[Any] | None:
+        if x is None:
+            return None
+        if isinstance(x, (list, tuple)):
+            return list(x)
+        # Common in HF parquet -> pandas: choices is a numpy array(dtype=object)
+        try:
+            import numpy as np  # type: ignore
+            if isinstance(x, np.ndarray):
+                return x.tolist()
+        except Exception:
+            pass
+        # PyArrow list scalars / other list-like containers
+        if hasattr(x, "to_pylist"):
+            try:
+                return list(x.to_pylist())
+            except Exception:
+                return None
+        # Fallback: try iterating
+        try:
+            return list(x)
+        except Exception:
+            return None
+
     for _, row in df.iterrows():
-        q = row.get("question", "")
+        q = row.get("question", "") or row.get("prompt", "") or row.get("input", "")
         subj = row.get("subject", "other")
+        subj = str(subj).strip() if subj is not None else "other"
+        if not subj:
+            subj = "other"
         if has_choices:
-            choices = row.get("choices", None)
-            if not isinstance(choices, (list, tuple)) or len(choices) < 4:
+            choices_raw = row.get("choices", None)
+            choices = _coerce_choices(choices_raw)
+            if not choices or len(choices) < 4:
                 continue
             A, B, C, D = choices[:4]
         else:
