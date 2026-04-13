@@ -418,7 +418,7 @@ def main() -> None:
                 except Exception as exc:
                     raise SystemExit(f"ERROR: failed to load MMLU from {args.mmlu_path}: {exc}") from exc
 
-            if args.medqa_path and Path(args.medqa_path).is_dir():
+            if args.medqa_path and Path(args.medqa_path).exists():
                 log("  Loading MedQA items ...")
                 try:
                     from src.data.medqa_loader import load_medqa_items

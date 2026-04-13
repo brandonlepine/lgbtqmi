@@ -522,9 +522,10 @@ def experiment_e_side_effects(
             prompt = item.get("prompt", "")
             correct = item.get("answer", "")
             is_demo = item.get("mentions_demographic", False)
+            letters = tuple(item.get("letters") or ("A", "B", "C", "D"))
 
-            baseline = steerer.evaluate_baseline_mcq(prompt, letters=("A", "B", "C", "D"))
-            steered = steerer.steer_and_evaluate(prompt, steering_vec, letters=("A", "B", "C", "D"))
+            baseline = steerer.evaluate_baseline_mcq(prompt, letters=letters)
+            steered = steerer.steer_and_evaluate(prompt, steering_vec, letters=letters)
 
             b_correct = int(baseline["model_answer"] == correct)
             s_correct = int(steered["model_answer"] == correct)

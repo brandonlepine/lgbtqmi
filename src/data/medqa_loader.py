@@ -7,11 +7,11 @@ steering (`scripts/run_sae_steering.py --experiments E --medqa_path ...`).
 Supported local formats:
 - Parquet shards with either:
   - columns: question, choices, answer  (choices is list-like; answer is index or letter)
-  - columns: question, A, B, C, D, answer
+  - columns: question, A, B, C, D, (optional E), answer or answer_idx
 - JSONL with the same schemas
 
 Output items are normalized to:
-  { "prompt": str, "answer": "A"|"B"|"C"|"D", "mentions_demographic": bool }
+  { "prompt": str, "answer": "A"|...|"E", "letters": tuple[str,...], "mentions_demographic": bool }
 """
 
 from __future__ import annotations
@@ -25,24 +25,21 @@ def _normalize_answer(ans: Any) -> str:
     if ans is None:
         return ""
     if isinstance(ans, int):
-        return {0: "A", 1: "B", 2: "C", 3: "D"}.get(ans, "")
+        return {0: "A", 1: "B", 2: "C", 3: "D", 4: "E"}.get(ans, "")
     s = str(ans).strip()
-    if s in {"0", "1", "2", "3"}:
-        return {0: "A", 1: "B", 2: "C", 3: "D"}.get(int(s), "")
+    if s in {"0", "1", "2", "3", "4"}:
+        return {0: "A", 1: "B", 2: "C", 3: "D", 4: "E"}.get(int(s), "")
     s = s.upper()
-    return s if s in {"A", "B", "C", "D"} else ""
+    return s if s in {"A", "B", "C", "D", "E"} else ""
 
 
-def _format_medqa_prompt(question: str, A: str, B: str, C: str, D: str) -> str:
-    # Minimal stable formatting; model answers with a single letter.
-    return (
-        f"{question}\n"
-        f"A. {A}\n"
-        f"B. {B}\n"
-        f"C. {C}\n"
-        f"D. {D}\n"
-        "Answer:"
-    )
+def _format_medqa_prompt(question: str, options: dict[str, str]) -> str:
+    """Minimal stable formatting; model answers with a single letter."""
+    lines = [str(question).strip()]
+    for k in sorted(options.keys()):
+        lines.append(f"{k}. {options[k]}")
+    lines.append("Answer:")
+    return "\n".join(lines)
 
 
 def _mentions_demographic(text: str) -> bool:
@@ -74,23 +71,39 @@ def _iter_medqa_from_objects(objs: Iterable[dict[str, Any]]) -> list[dict[str, A
         if not q:
             continue
 
-        if "choices" in obj and isinstance(obj["choices"], (list, tuple)) and len(obj["choices"]) >= 4:
-            A, B, C, D = obj["choices"][:4]
+        options: dict[str, str] = {}
+        if "options" in obj and isinstance(obj["options"], dict) and obj["options"]:
+            # Common MedQA JSONL schema: {"question": ..., "options": {"A":..., ...}, "answer_idx": "E"}
+            options = {str(k).strip().upper(): str(v) for k, v in obj["options"].items()}
+        elif "choices" in obj and isinstance(obj["choices"], (list, tuple)) and len(obj["choices"]) >= 4:
+            # HF-style: choices is list-like, answer is index or letter.
+            choices = [str(x) for x in obj["choices"]]
+            letters = ["A", "B", "C", "D", "E"]
+            options = {letters[i]: choices[i] for i in range(min(len(choices), len(letters)))}
         else:
-            A, B, C, D = obj.get("A", ""), obj.get("B", ""), obj.get("C", ""), obj.get("D", "")
+            for k in ["A", "B", "C", "D", "E"]:
+                v = obj.get(k, "")
+                if v:
+                    options[k] = str(v)
 
         ans = _normalize_answer(obj.get("answer", obj.get("label", "")))
         if not ans:
             # Some datasets use answer_idx
             ans = _normalize_answer(obj.get("answer_idx", None))
-        if not (A and B and C and D and ans):
+        # Require at least A-D; E is optional.
+        if not (options.get("A") and options.get("B") and options.get("C") and options.get("D") and ans):
+            continue
+        if ans not in options:
+            # If answer points to a missing option key, skip (schema mismatch).
             continue
 
-        prompt = _format_medqa_prompt(str(q), str(A), str(B), str(C), str(D))
+        prompt = _format_medqa_prompt(str(q), options)
+        letters = tuple(sorted(options.keys()))
         items.append(
             {
                 "prompt": prompt,
                 "answer": ans,
+                "letters": letters,
                 "mentions_demographic": _mentions_demographic(prompt),
             }
         )
@@ -140,7 +153,16 @@ def load_medqa_items(path: str | Path, *, max_items: int | None = None) -> list[
             if max_items is not None and len(items) >= max_items:
                 break
         if (max_items is None) or (len(items) < max_items):
-            for f in jsonl_files:
+            # Prefer canonical split files when present (avoid aux jsonl like metamap phrases).
+            preferred = []
+            for name in ["test.jsonl", "dev.jsonl", "train.jsonl", "US_qbank.jsonl"]:
+                fp = p / name
+                if fp.exists() and fp.is_file():
+                    preferred.append(fp)
+            preferred_set = {x.resolve() for x in preferred}
+            ordered_jsonl = preferred + [f for f in jsonl_files if f.resolve() not in preferred_set]
+
+            for f in ordered_jsonl:
                 items.extend(_iter_medqa_from_objects(_iter_jsonl(f)))
                 if max_items is not None and len(items) >= max_items:
                     break
