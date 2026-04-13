@@ -30,6 +30,58 @@ def _normalize_answer(ans: Any) -> str:
     return s if s in {"A", "B", "C", "D"} else ""
 
 
+def _iter_parquet_items(path: Path) -> Iterable[dict[str, Any]]:
+    """Load common HF-downloaded parquet formats (e.g., cais/mmlu)."""
+    try:
+        import pandas as pd  # type: ignore
+    except ImportError as exc:
+        raise ImportError(
+            "Reading MMLU parquet requires pandas + pyarrow. Install with: pip install pandas pyarrow"
+        ) from exc
+
+    df = pd.read_parquet(path)
+    items: list[dict[str, Any]] = []
+
+    cols = set(df.columns)
+    has_choices = {"question", "choices", "answer"}.issubset(cols)
+    has_abcd = {"question", "A", "B", "C", "D", "answer"}.issubset(cols)
+
+    if not (has_choices or has_abcd):
+        raise ValueError(
+            f"Unsupported parquet schema in {path}. Columns={sorted(cols)}. "
+            "Expected either (question, choices, answer[, subject]) or (question, A,B,C,D, answer[, subject])."
+        )
+
+    for _, row in df.iterrows():
+        q = row.get("question", "")
+        subj = row.get("subject", "other")
+        if has_choices:
+            choices = row.get("choices", None)
+            if not isinstance(choices, (list, tuple)) or len(choices) < 4:
+                continue
+            A, B, C, D = choices[:4]
+        else:
+            A, B, C, D = row.get("A", ""), row.get("B", ""), row.get("C", ""), row.get("D", "")
+
+        ans_l = _normalize_answer(row.get("answer", ""))
+        if not q or not ans_l:
+            continue
+
+        items.append(
+            {
+                "subject": str(subj) if subj is not None else "other",
+                "few_shot_text": "",
+                "question": str(q),
+                "A": str(A),
+                "B": str(B),
+                "C": str(C),
+                "D": str(D),
+                "answer": ans_l,
+            }
+        )
+    return items
+
+
 def _iter_csv_items(path: Path, subject: str) -> Iterable[dict[str, Any]]:
     with path.open("r", encoding="utf-8", newline="") as f:
         reader = csv.reader(f)
@@ -147,6 +199,7 @@ def load_mmlu_items(path: str | Path, *, max_items: int | None = None) -> list[d
     elif p.is_dir():
         csv_files = sorted(p.rglob("*_test.csv")) or sorted(p.rglob("*.csv"))
         jsonl_files = sorted(p.rglob("*.jsonl"))
+        parquet_files = sorted(p.rglob("*.parquet"))
         for f in csv_files:
             subject = f.stem.replace("_test", "").replace("_dev", "")
             items.extend(_iter_csv_items(f, subject))
@@ -155,6 +208,11 @@ def load_mmlu_items(path: str | Path, *, max_items: int | None = None) -> list[d
         if (max_items is None) or (len(items) < max_items):
             for f in jsonl_files:
                 items.extend(_iter_jsonl_items(f, None))
+                if max_items is not None and len(items) >= max_items:
+                    break
+        if (max_items is None) or (len(items) < max_items):
+            for f in parquet_files:
+                items.extend(_iter_parquet_items(f))
                 if max_items is not None and len(items) >= max_items:
                     break
     else:
