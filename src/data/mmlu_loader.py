@@ -42,6 +42,46 @@ def _iter_parquet_items(path: Path) -> Iterable[dict[str, Any]]:
     df = pd.read_parquet(path)
     items: list[dict[str, Any]] = []
 
+    def _as_dict(x: Any) -> dict[str, Any] | None:
+        if isinstance(x, dict):
+            return x
+        # Some parquet readers can return mapping-like objects that still cast cleanly.
+        try:
+            if hasattr(x, "keys") and hasattr(x, "__getitem__"):
+                return dict(x)
+        except Exception:
+            return None
+        return None
+
+    def _maybe_flatten_single_column(frame: "pd.DataFrame") -> "pd.DataFrame":
+        """Handle HF parquet shards with a single nested-record column.
+
+        Example seen on RunPod:
+          datasets/mmlu/auxiliary_train/train-00000-of-00001.parquet
+          Columns=['train'] where each row is a dict-like record.
+        """
+        if len(frame.columns) != 1:
+            return frame
+        col = str(frame.columns[0])
+        series = frame.iloc[:, 0]
+        first = series.iloc[0] if len(series) else None
+        d0 = _as_dict(first)
+        if d0 is None:
+            return frame
+        # Flatten dict rows into a DataFrame.
+        dict_rows = []
+        for v in series.tolist():
+            dv = _as_dict(v)
+            if dv is None:
+                return frame
+            dict_rows.append(dv)
+        return pd.DataFrame(dict_rows)
+
+    # If schema doesn't match, try flattening single nested column then re-check.
+    df2 = _maybe_flatten_single_column(df)
+    if df2 is not df:
+        df = df2
+
     cols = set(df.columns)
     has_choices = {"question", "choices", "answer"}.issubset(cols)
     has_abcd = {"question", "A", "B", "C", "D", "answer"}.issubset(cols)
@@ -49,7 +89,9 @@ def _iter_parquet_items(path: Path) -> Iterable[dict[str, Any]]:
     if not (has_choices or has_abcd):
         raise ValueError(
             f"Unsupported parquet schema in {path}. Columns={sorted(cols)}. "
-            "Expected either (question, choices, answer[, subject]) or (question, A,B,C,D, answer[, subject])."
+            "Expected either (question, choices, answer[, subject]) or (question, A,B,C,D, answer[, subject]). "
+            "If this is an HF-downloaded shard with a single nested column (e.g., 'train'), "
+            "ensure rows are dict-like records; otherwise convert to a supported format."
         )
 
     for _, row in df.iterrows():
