@@ -43,16 +43,32 @@ def _format_medqa_prompt(question: str, options: dict[str, str]) -> str:
 
 
 def _mentions_demographic(text: str) -> bool:
-    # Conservative heuristic; used only for reporting side-effects.
+    """Heuristic: does the prompt explicitly mention a social identity category?
+
+    This is intentionally *narrow* to avoid flagging most MedQA items (e.g., "67-year-old"
+    would otherwise mark nearly everything as demographic).
+    """
+    import re
+
     t = text.lower()
-    keywords = [
-        "trans", "transgender", "gay", "lesbian", "bisexual", "pansexual",
-        "black", "white", "asian", "latino", "hispanic", "arab",
-        "muslim", "jewish", "christian", "catholic",
-        "disabled", "autistic", "blind", "deaf",
-        "old", "elderly", "pregnant",
+
+    patterns = [
+        # Sexual orientation / gender identity
+        r"\b(gay|lesbian|bisexual|pansexual)\b",
+        r"\b(transgender|cisgender|nonbinary|non-binary)\b",
+        # Use word boundary to avoid false positives like "transport"
+        r"\btrans\b",
+        r"\bcis\b",
+        # Religion (explicit labels)
+        r"\b(muslim|jewish|christian|catholic|hindu|mormon|orthodox|atheist)\b",
+        # Race/ethnicity (prefer multi-word labels to avoid medical “black/white” false positives)
+        r"\b(african american|native american|middle eastern|latino|hispanic|arab)\b",
+        # Disability / physical difference (these are closer to our BBQ categories)
+        r"\b(autistic|blind|deaf|wheelchair)\b",
+        r"\b(down['’]s syndrome)\b",
     ]
-    return any(k in t for k in keywords)
+
+    return any(re.search(p, t) for p in patterns)
 
 
 def _iter_jsonl(path: Path) -> Iterable[dict[str, Any]]:

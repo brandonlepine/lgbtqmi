@@ -118,12 +118,13 @@ def _iter_parquet_items(path: Path) -> Iterable[dict[str, Any]]:
         except Exception:
             return None
 
+    fallback_subject = path.parent.name
     for _, row in df.iterrows():
         q = row.get("question", "") or row.get("prompt", "") or row.get("input", "")
-        subj = row.get("subject", "other")
-        subj = str(subj).strip() if subj is not None else "other"
+        subj = row.get("subject", fallback_subject)
+        subj = str(subj).strip() if subj is not None else fallback_subject
         if not subj:
-            subj = "other"
+            subj = fallback_subject or "other"
         if has_choices:
             choices_raw = row.get("choices", None)
             choices = _coerce_choices(choices_raw)
@@ -281,7 +282,35 @@ def load_mmlu_items(path: str | Path, *, max_items: int | None = None) -> list[d
                 if max_items is not None and len(items) >= max_items:
                     break
         if (max_items is None) or (len(items) < max_items):
+            # HF-downloaded `cais/mmlu` includes massive aggregated shards under:
+            # - all/
+            # - auxiliary_train/ (often subject is empty)
+            # Those skew sampling and make per-subject plots meaningless when max_items is small.
+            # Prefer per-subject {test,validation,dev} shards by default.
+            filtered: list[Path] = []
             for f in parquet_files:
+                rel = f.relative_to(p)
+                top = rel.parts[0] if rel.parts else ""
+                if top in {"all", "auxiliary_train"}:
+                    continue
+                filtered.append(f)
+            candidates = filtered if filtered else parquet_files
+
+            def _split_priority(fp: Path) -> tuple[int, str]:
+                name = fp.name.lower()
+                if name.startswith("test-"):
+                    pr = 0
+                elif name.startswith("validation-"):
+                    pr = 1
+                elif name.startswith("dev-"):
+                    pr = 2
+                else:
+                    pr = 3
+                return (pr, str(fp))
+
+            candidates = sorted(candidates, key=_split_priority)
+
+            for f in candidates:
                 items.extend(_iter_parquet_items(f))
                 if max_items is not None and len(items) >= max_items:
                     break

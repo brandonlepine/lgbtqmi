@@ -402,6 +402,28 @@ def main() -> None:
         all_pro_features = list(set(all_pro_features))
 
         if all_pro_features:
+            # If user runs only Experiment E, attempt to reuse cached Experiment A optimal alphas.
+            if not optimal_alphas:
+                exp_dir = output_dir / "experiments"
+                for cat in valid_cats:
+                    p = exp_dir / f"experiment_A_{cat}.json"
+                    if not p.exists():
+                        continue
+                    try:
+                        with open(p) as f:
+                            a = json.load(f)
+                        optimal_alphas[cat] = float(a.get("optimal_alpha", -10.0))
+                    except Exception:
+                        continue
+                if optimal_alphas:
+                    log(f"  Reusing cached optimal alphas for E: {sorted(optimal_alphas.keys())}")
+
+            if not optimal_alphas:
+                raise SystemExit(
+                    "ERROR: Experiment E requires non-empty optimal alphas from Experiment A. "
+                    "Run with --experiments 'A,E' (or run A once so E can reuse cached results)."
+                )
+
             mean_alpha = sum(optimal_alphas.values()) / max(len(optimal_alphas), 1)
             composite_vec = steerer.get_composite_steering(all_pro_features, mean_alpha)
 
