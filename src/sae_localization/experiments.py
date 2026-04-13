@@ -469,6 +469,7 @@ def experiment_e_side_effects(
         log(f"  Experiment E1 (MMLU): {len(mmlu_items)} items")
         orig_correct = 0
         steered_correct = 0
+        n_flipped = 0
         per_subject: dict[str, dict[str, int]] = {}
 
         for i, item in enumerate(mmlu_items):
@@ -483,11 +484,14 @@ def experiment_e_side_effects(
             s_correct = int(steered["model_answer"] == correct)
             orig_correct += b_correct
             steered_correct += s_correct
+            flipped = int(baseline["model_answer"] != steered["model_answer"])
+            n_flipped += flipped
 
-            per_subject.setdefault(subject, {"orig": 0, "steered": 0, "total": 0})
+            per_subject.setdefault(subject, {"orig": 0, "steered": 0, "total": 0, "flipped": 0})
             per_subject[subject]["orig"] += b_correct
             per_subject[subject]["steered"] += s_correct
             per_subject[subject]["total"] += 1
+            per_subject[subject]["flipped"] += flipped
 
             if (i + 1) % 50 == 0:
                 log(f"    MMLU [{i + 1}/{len(mmlu_items)}]")
@@ -498,11 +502,14 @@ def experiment_e_side_effects(
             "accuracy_original": orig_correct / max(n, 1),
             "accuracy_steered": steered_correct / max(n, 1),
             "delta": (steered_correct - orig_correct) / max(n, 1),
+            "flip_rate": n_flipped / max(n, 1),
+            "n_flipped": n_flipped,
             "per_subject": {
                 s: {
                     "accuracy_original": d["orig"] / max(d["total"], 1),
                     "accuracy_steered": d["steered"] / max(d["total"], 1),
                     "delta": (d["steered"] - d["orig"]) / max(d["total"], 1),
+                    "flip_rate": d["flipped"] / max(d["total"], 1),
                     "n_items": d["total"],
                 }
                 for s, d in per_subject.items()
@@ -514,9 +521,11 @@ def experiment_e_side_effects(
         log(f"  Experiment E2 (MedQA): {len(medqa_items)} items")
         orig_correct = 0
         steered_correct = 0
+        n_flipped = 0
         demo_orig = 0
         demo_steered = 0
         n_demo = 0
+        demo_flipped = 0
 
         for i, item in enumerate(medqa_items):
             prompt = item.get("prompt", "")
@@ -531,11 +540,14 @@ def experiment_e_side_effects(
             s_correct = int(steered["model_answer"] == correct)
             orig_correct += b_correct
             steered_correct += s_correct
+            flipped = int(baseline["model_answer"] != steered["model_answer"])
+            n_flipped += flipped
 
             if is_demo:
                 demo_orig += b_correct
                 demo_steered += s_correct
                 n_demo += 1
+                demo_flipped += flipped
 
             if (i + 1) % 50 == 0:
                 log(f"    MedQA [{i + 1}/{len(medqa_items)}]")
@@ -546,10 +558,14 @@ def experiment_e_side_effects(
             "accuracy_original": orig_correct / max(n, 1),
             "accuracy_steered": steered_correct / max(n, 1),
             "delta": (steered_correct - orig_correct) / max(n, 1),
+            "flip_rate": n_flipped / max(n, 1),
+            "n_flipped": n_flipped,
             "n_demographic": n_demo,
             "demographic_accuracy_original": demo_orig / max(n_demo, 1),
             "demographic_accuracy_steered": demo_steered / max(n_demo, 1),
             "demographic_delta": (demo_steered - demo_orig) / max(n_demo, 1),
+            "demographic_flip_rate": demo_flipped / max(n_demo, 1),
+            "n_demographic_flipped": demo_flipped,
         }
 
     atomic_save_json(result, output_dir / "experiment_E_side_effects.json")

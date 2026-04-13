@@ -251,7 +251,7 @@ def fig_side_effects_mmlu(
     exp_e: dict[str, Any],
     output_dir: Path,
 ) -> None:
-    """Scatter: accuracy delta per MMLU subject."""
+    """Scatter: accuracy delta per MMLU subject (colored by flip rate)."""
     mmlu = exp_e.get("mmlu", {})
     per_subject = mmlu.get("per_subject", {})
     if not per_subject:
@@ -259,18 +259,28 @@ def fig_side_effects_mmlu(
 
     subjects = sorted(per_subject.keys())
     deltas = [per_subject[s]["delta"] for s in subjects]
+    flip_rates = [per_subject[s].get("flip_rate", 0.0) for s in subjects]
     overall_delta = mmlu.get("delta", 0)
+    overall_flip = mmlu.get("flip_rate", None)
 
     fig, ax = plt.subplots(figsize=(10, 5))
     x = np.arange(len(subjects))
-    colors = [VERMILLION if abs(d) > 0.02 else GRAY for d in deltas]
+    # Color by flip rate (if present), else fallback to delta magnitude.
+    if any(fr > 0 for fr in flip_rates):
+        colors = flip_rates
+        sc = ax.scatter(x, deltas, c=colors, s=35, zorder=3, cmap="viridis", vmin=0.0, vmax=max(max(flip_rates), 1e-6))
+        cbar = fig.colorbar(sc, ax=ax, shrink=0.8)
+        cbar.set_label("Flip rate")
+    else:
+        colors = [VERMILLION if abs(d) > 0.02 else GRAY for d in deltas]
+        ax.scatter(x, deltas, c=colors, s=30, zorder=3)
 
-    ax.scatter(x, deltas, c=colors, s=30, zorder=3)
     ax.axhline(0, ls="--", color="black", lw=0.8)
     ax.set_xticks(x)
     ax.set_xticklabels(subjects, rotation=90, fontsize=6)
     ax.set_ylabel("Accuracy delta (steered − original)")
-    ax.set_title(f"MMLU accuracy impact (overall Δ = {overall_delta:+.3f})")
+    extra = f", flip={overall_flip:.3f}" if isinstance(overall_flip, (float, int)) else ""
+    ax.set_title(f"MMLU accuracy impact (overall Δ = {overall_delta:+.3f}{extra})")
 
     _save_both(fig, output_dir / "fig_side_effects_mmlu.png")
     log("    Saved fig_side_effects_mmlu")
@@ -285,7 +295,7 @@ def fig_medqa_demographic(
     exp_e: dict[str, Any],
     output_dir: Path,
 ) -> None:
-    """Bar chart: MedQA accuracy on demographic items."""
+    """Bar chart: MedQA accuracy on demographic items (annotate flip rates)."""
     medqa = exp_e.get("medqa", {})
     if not medqa:
         return
@@ -294,11 +304,25 @@ def fig_medqa_demographic(
     labels = ["All items", "Demographic items"]
     orig = [medqa.get("accuracy_original", 0), medqa.get("demographic_accuracy_original", 0)]
     steered = [medqa.get("accuracy_steered", 0), medqa.get("demographic_accuracy_steered", 0)]
+    flips = [medqa.get("flip_rate", 0), medqa.get("demographic_flip_rate", 0)]
+    ns = [medqa.get("n_items", 0), medqa.get("n_demographic", 0)]
 
     x = np.arange(len(labels))
     width = 0.3
     ax.bar(x - width / 2, orig, width, color=VERMILLION, alpha=0.7, label="Original")
     ax.bar(x + width / 2, steered, width, color=BLUE, alpha=0.7, label="Steered")
+
+    # Annotate flip rates + n
+    for i in range(len(labels)):
+        ax.text(
+            x[i],
+            max(orig[i], steered[i]) + 0.02,
+            f"flip={flips[i]:.2f}\\nn={ns[i]}",
+            ha="center",
+            va="bottom",
+            fontsize=8,
+            color=GRAY,
+        )
 
     ax.set_xticks(x)
     ax.set_xticklabels(labels, fontsize=10)
