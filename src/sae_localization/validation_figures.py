@@ -191,6 +191,15 @@ def fig_random_control_overlay(
     """Feature steering vs random control curves."""
     per_cat = random_summary.get("per_category", {})
 
+    def _numeric_key_map(d: dict[str, Any]) -> dict[float, Any]:
+        out: dict[float, Any] = {}
+        for k, v in d.items():
+            try:
+                out[float(k)] = v
+            except Exception:
+                continue
+        return out
+
     for cat, rdata in per_cat.items():
         per_alpha = rdata.get("per_alpha_random", {})
         feat = feature_results.get(cat, {})
@@ -200,14 +209,16 @@ def fig_random_control_overlay(
             continue
 
         # Build curves
-        alphas_r = sorted(float(a) for a in per_alpha.keys())
-        rand_mean = [per_alpha[str(a)]["random_flip_mean"] for a in alphas_r]
-        rand_std = [per_alpha[str(a)]["random_flip_std"] for a in alphas_r]
+        per_alpha_num = _numeric_key_map(per_alpha)
+        alphas_r = sorted(per_alpha_num.keys())
+        rand_mean = [per_alpha_num[a]["random_flip_mean"] for a in alphas_r]
+        rand_std = [per_alpha_num[a]["random_flip_std"] for a in alphas_r]
 
         # Feature curve (use absolute alpha for x-axis)
-        alphas_f = sorted(float(a) for a in feat_per_alpha.keys())
+        feat_per_alpha_num = _numeric_key_map(feat_per_alpha)
+        alphas_f = sorted(feat_per_alpha_num.keys())
         feat_corr = [
-            feat_per_alpha[str(a)].get("correction_rate", feat_per_alpha[str(a)].get("flip_rate", 0))
+            feat_per_alpha_num[a].get("correction_rate", feat_per_alpha_num[a].get("flip_rate", 0))
             for a in alphas_f
         ]
 
