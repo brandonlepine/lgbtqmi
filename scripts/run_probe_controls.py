@@ -218,16 +218,34 @@ def run_permutation_control(
     """Permutation control: real vs shuffled subgroup labels."""
     meta = data["meta"]
 
-    # Subgroup labels
-    y_sub = np.array([
-        m.get("stereotyped_groups", [""])[0]
-        if isinstance(m.get("stereotyped_groups"), list) and m.get("stereotyped_groups")
-        else str(m.get("model_answer_role", ""))
-        for m in meta
-    ])
+    # Load subgroup labels from processed stimuli (not Stage 1 metadata,
+    # which may lack stereotyped_groups)
+    proc_dir = PROJECT_ROOT / "data" / "processed"
+    files = sorted(proc_dir.glob(f"stimuli_{cat}_*.json"))
+    stimuli_by_idx: dict[int, dict] = {}
+    if files:
+        with open(files[-1]) as f:
+            for it in json.load(f):
+                idx = it.get("item_idx", -1)
+                if idx >= 0:
+                    stimuli_by_idx[idx] = it
+
+    y_sub = []
+    for m in meta:
+        idx = m.get("item_idx", -1)
+        stim = stimuli_by_idx.get(idx, {})
+        groups = stim.get("stereotyped_groups", [])
+        # Use last (most specific) stereotyped group as the subgroup label.
+        # For categories like disability, groups = ["disabled", "mentally-ill"]
+        # and we want "mentally-ill", not the generic "disabled".
+        y_sub.append(groups[-1] if groups else "")
+    y_sub = np.array(y_sub)
 
     # Filter to items with valid labels
     valid_mask = np.array([len(str(y)) > 0 and y != "" for y in y_sub])
+
+    n_unique = len(set(y_sub[valid_mask])) if valid_mask.sum() > 0 else 0
+    log(f"    {valid_mask.sum()} items with subgroup labels, {n_unique} unique subgroups")
     if valid_mask.sum() < 10:
         return {"category": cat, "layers": [], "real_acc": [], "perm_mean": [], "perm_std": []}
 
@@ -438,7 +456,7 @@ def run_within_category_generalization(
             idx = m.get("item_idx", -1)
             stim = stimuli_by_idx.get(idx, {})
             groups = stim.get("stereotyped_groups", [])
-            subgroups.append(groups[0] if groups else "")
+            subgroups.append(groups[-1] if groups else "")
         subgroups_arr = np.array(subgroups)
 
         unique_subs = sorted(set(s for s in subgroups if s))
