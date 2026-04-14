@@ -808,7 +808,9 @@ def main() -> None:
             atomic_save_json(mmlu_entry, mmlu_out / f"{vec_key}.json")
 
         # Memory cleanup
-        if hasattr(torch, "mps") and hasattr(torch.mps, "empty_cache"):
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        elif hasattr(torch, "mps") and torch.backends.mps.is_available():
             torch.mps.empty_cache()
 
     # Save aggregated results

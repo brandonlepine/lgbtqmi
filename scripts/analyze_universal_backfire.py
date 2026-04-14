@@ -355,10 +355,10 @@ def compute_transfer_effects(
 
             # Memory cleanup
             import torch as _torch
-            if hasattr(_torch, "mps") and hasattr(_torch.mps, "empty_cache"):
-                _torch.mps.empty_cache()
-            elif _torch.cuda.is_available():
+            if _torch.cuda.is_available():
                 _torch.cuda.empty_cache()
+            elif hasattr(_torch, "mps") and _torch.backends.mps.is_available():
+                _torch.mps.empty_cache()
 
     return results
 

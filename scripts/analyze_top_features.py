@@ -354,10 +354,10 @@ def analyze_token_level(
 
         # Memory cleanup per item
         del captured, hidden_all, hidden_2d, feat_acts
-        if hasattr(torch, "mps") and hasattr(torch.mps, "empty_cache"):
-            torch.mps.empty_cache()
-        elif torch.cuda.is_available():
+        if torch.cuda.is_available():
             torch.cuda.empty_cache()
+        elif hasattr(torch, "mps") and torch.backends.mps.is_available():
+            torch.mps.empty_cache()
 
     # Sort by last-token activation (descending)
     item_activations.sort(key=lambda x: -x[1])

@@ -332,6 +332,7 @@ if [[ "${RUN_SAE}" == "1" ]]; then
     --model_id "${MODEL_ID}" \
     --device "${DEVICE}" \
     --categories "${SAE_CATEGORIES}" \
+    --run_date "${RUN_DATE}" \
     "${SAE_MAX_ITEMS_ARGS[@]}"
 
   echo
@@ -376,7 +377,7 @@ if [[ "${RUN_SAE}" == "1" ]]; then
         --ranked_features "${RANKED_PATH}" \
         --localization_dir "${SAE_LOC_DIR}" \
         --categories "${SAE_CATEGORIES}" \
-        --alpha_values "${SAE_ALPHA_VALUES}" \
+        --alpha_values="${SAE_ALPHA_VALUES}" \
         --k_steps "${SAE_K_STEPS}" \
         "${SAE_MAX_ITEMS_ARGS[@]}"
 

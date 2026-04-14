@@ -352,10 +352,10 @@ def run_stepwise_sweep(
                 f"eta={eta:.3f} ||v||={vec_norm:.3f}")
 
         # Memory cleanup
-        if hasattr(torch, "mps") and hasattr(torch.mps, "empty_cache"):
-            torch.mps.empty_cache()
-        elif torch.cuda.is_available():
+        if torch.cuda.is_available():
             torch.cuda.empty_cache()
+        elif hasattr(torch, "mps") and torch.backends.mps.is_available():
+            torch.mps.empty_cache()
 
     # Tie-break: among configs within 1% of best eta, prefer smaller ||v||
     if grid:
