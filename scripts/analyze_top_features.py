@@ -229,6 +229,182 @@ def analyze_max_activating(
 
 
 # ---------------------------------------------------------------------------
+# Analysis A2: Token-level max-activating analysis (--token_level)
+# ---------------------------------------------------------------------------
+
+
+def analyze_token_level(
+    feature_idx: int,
+    layer: int,
+    sae: Any,
+    wrapper: Any,
+    stimuli: dict[int, dict[str, Any]],
+    metas: dict[int, dict[str, Any]],
+    top_k_items: int = 20,
+    top_k_tokens: int = 5,
+    max_items: int | None = None,
+) -> dict[str, Any]:
+    """Token-level feature analysis: find which tokens maximally activate a feature.
+
+    Runs the model with a hook at the feature's layer to capture hidden states
+    at ALL token positions, then encodes each position through the SAE.
+
+    Parameters
+    ----------
+    feature_idx : int
+        SAE feature index.
+    layer : int
+        Layer to hook.
+    sae : SAEWrapper
+        SAE for encoding.
+    wrapper : ModelWrapper
+        The language model (for forward passes).
+    stimuli : dict
+        item_idx -> processed stimulus dict (must have prompt text).
+    metas : dict
+        item_idx -> Stage 1 metadata dict.
+    top_k_items : int
+        Number of top items to report.
+    top_k_tokens : int
+        Number of top tokens to report per item.
+    max_items : int | None
+        Cap items to process (for speed).
+
+    Returns
+    -------
+    dict with per-item token-level activations and a cross-item token frequency table.
+    """
+    import torch
+    from src.extraction.activations import format_prompt
+
+    tokenizer = wrapper.tokenizer
+
+    # Collect items with prompts
+    item_indices = sorted(stimuli.keys())
+    if max_items:
+        item_indices = item_indices[:max_items]
+
+    # For each item, run through model, capture hidden states at all positions
+    item_activations: list[tuple[int, float, list[dict]]] = []
+    # (item_idx, last_token_activation, top_token_details)
+
+    for item_idx in item_indices:
+        stim = stimuli.get(item_idx, {})
+        if "context" not in stim or "question" not in stim:
+            continue
+
+        try:
+            prompt = format_prompt(stim)
+        except (KeyError, TypeError):
+            continue
+
+        # Tokenize
+        inputs = tokenizer(prompt, return_tensors="pt").to(wrapper.device)
+        input_ids = inputs["input_ids"][0]
+        seq_len = input_ids.shape[0]
+
+        # Register hook to capture all-position hidden states
+        captured: list[torch.Tensor] = []
+
+        def _capture_hook(module: Any, args: Any, output: Any) -> None:
+            from src.models.wrapper import _extract_hidden_candidate
+            hidden = _extract_hidden_candidate(output, wrapper.hidden_dim)
+            captured.append(hidden.detach())
+
+        handle, counter = wrapper.register_residual_hook(layer, _capture_hook,
+                                                          name="token_level_capture")
+        try:
+            with torch.no_grad():
+                wrapper.model(**inputs)
+        finally:
+            handle.remove()
+
+        if not captured:
+            continue
+
+        hidden_all = captured[0]  # (1, seq_len, hidden_dim)
+
+        # Encode each position through SAE
+        # Process in a single batch for efficiency
+        hidden_2d = hidden_all.squeeze(0)  # (seq_len, hidden_dim)
+        feat_acts = sae.encode(hidden_2d)  # (seq_len, n_features)
+
+        if feature_idx >= feat_acts.shape[-1]:
+            continue
+
+        per_pos = feat_acts[:, feature_idx]  # (seq_len,)
+        last_act = float(per_pos[-1])
+
+        # Find top-k token positions
+        top_vals, top_idxs = torch.topk(per_pos, min(top_k_tokens, seq_len))
+        token_details = []
+        for pos_idx, act_val in zip(top_idxs.tolist(), top_vals.tolist()):
+            if act_val <= 0:
+                break
+            token_id = int(input_ids[pos_idx])
+            token_str = tokenizer.decode([token_id]).strip()
+            token_details.append({
+                "position": pos_idx,
+                "token": token_str,
+                "token_id": token_id,
+                "activation": round(act_val, 4),
+            })
+
+        item_activations.append((item_idx, last_act, token_details))
+
+        # Memory cleanup per item
+        del captured, hidden_all, hidden_2d, feat_acts
+        if hasattr(torch, "mps") and hasattr(torch.mps, "empty_cache"):
+            torch.mps.empty_cache()
+        elif torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    # Sort by last-token activation (descending)
+    item_activations.sort(key=lambda x: -x[1])
+
+    # Build top items report
+    top_items = []
+    for item_idx, last_act, token_details in item_activations[:top_k_items]:
+        stim = stimuli.get(item_idx, {})
+        meta = metas.get(item_idx, {})
+        prompt = ""
+        try:
+            prompt = format_prompt(stim)
+        except (KeyError, TypeError):
+            pass
+        top_items.append({
+            "item_idx": item_idx,
+            "last_token_activation": round(last_act, 4),
+            "prompt_preview": prompt[:120],
+            "model_answer_role": meta.get("model_answer_role", ""),
+            "stereotyped_groups": stim.get("stereotyped_groups", []),
+            "context_condition": stim.get("context_condition", ""),
+            "max_token_position": token_details[0]["position"] if token_details else -1,
+            "max_token_string": token_details[0]["token"] if token_details else "",
+            "max_token_activation": token_details[0]["activation"] if token_details else 0.0,
+            "token_activations_top5": token_details,
+        })
+
+    # Build cross-item token frequency table
+    from collections import Counter
+    token_freq: Counter[str] = Counter()
+    for _, _, token_details in item_activations[:top_k_items]:
+        for td in token_details:
+            token_freq[td["token"]] += 1
+
+    return {
+        "feature_idx": feature_idx,
+        "layer": layer,
+        "n_items_processed": len(item_activations),
+        "top_items": top_items,
+        "token_frequency": [
+            {"token": tok, "count": cnt}
+            for tok, cnt in token_freq.most_common(30)
+        ],
+    }
+
+
+# ---------------------------------------------------------------------------
 # Analysis B: Stereotype specificity
 # ---------------------------------------------------------------------------
 
@@ -510,6 +686,66 @@ def fig_cooccurrence(
     log(f"    Saved fig_feature_cooccurrence_{category}")
 
 
+def fig_token_level(
+    token_reports: dict[str, list[dict[str, Any]]],
+    category: str,
+    output_dir: Path,
+) -> None:
+    """Token frequency bar chart for each subgroup's top features (token-level analysis)."""
+    subs = sorted(token_reports.keys())
+    if not subs:
+        return
+
+    n = len(subs)
+    ncols = min(3, n)
+    nrows = (n + ncols - 1) // ncols
+
+    fig, axes = plt.subplots(nrows, ncols, figsize=(5 * ncols, 4 * nrows), squeeze=False)
+
+    for idx, sub in enumerate(subs):
+        row, col = divmod(idx, ncols)
+        ax = axes[row, col]
+        reports = token_reports[sub]
+        if not reports:
+            ax.set_visible(False)
+            continue
+
+        # Aggregate token frequencies across all features for this subgroup
+        from collections import Counter
+        combined_freq: Counter[str] = Counter()
+        for r in reports:
+            for entry in r.get("token_frequency", []):
+                combined_freq[entry["token"]] += entry["count"]
+
+        top_tokens = combined_freq.most_common(15)
+        if not top_tokens:
+            ax.set_visible(False)
+            continue
+
+        tokens = [t for t, _ in top_tokens]
+        counts = [c for _, c in top_tokens]
+
+        y_pos = np.arange(len(tokens))
+        ax.barh(y_pos, counts, color=BLUE, alpha=0.8)
+        ax.set_yticks(y_pos)
+        ax.set_yticklabels(tokens, fontsize=7)
+        ax.invert_yaxis()
+        ax.set_xlabel("Frequency (across top items)", fontsize=8)
+        ax.set_title(f"{sub} ({len(reports)} features)", fontsize=9)
+
+        ax.text(0.02, 0.95, chr(65 + idx), transform=ax.transAxes,
+                fontsize=10, fontweight="bold", va="top")
+
+    for idx in range(n, nrows * ncols):
+        row, col = divmod(idx, ncols)
+        axes[row, col].set_visible(False)
+
+    cat_label = CATEGORY_LABELS.get(category, category)
+    fig.suptitle(f"Max-activating tokens -- {cat_label}", fontsize=11)
+    _save_both(fig, output_dir / f"fig_token_level_{category}.png")
+    log(f"    Saved fig_token_level_{category}")
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -577,11 +813,20 @@ def main() -> None:
             expansion=args.sae_expansion, device=args.device,
         )
 
+    # Load model wrapper for token-level analysis
+    wrapper = None
+    if args.token_level:
+        log("Loading model for token-level analysis ...")
+        from src.models.wrapper import ModelWrapper
+        wrapper = ModelWrapper.from_pretrained(args.model_path, device=args.device)
+        log(f"  Model loaded: {wrapper.n_layers} layers, hidden_dim={wrapper.hidden_dim}")
+
     # Process per category
     all_reports: list[dict[str, Any]] = []
     all_specificities: list[float] = []
     cross_sub_matrices: dict[str, dict[str, Any]] = {}
     all_cooccurrence: dict[str, dict[str, dict[str, Any]]] = {}
+    all_token_reports: dict[str, dict[str, list[dict]]] = {}  # cat -> sub -> list of token reports
 
     for cat in categories:
         log(f"\n{'='*50}")
@@ -705,6 +950,35 @@ def main() -> None:
                     cat_cooccurrence[sub] = cooc
                     atomic_save_json(cooc, output_dir / f"cooccurrence_{cat}_{sub}.json")
 
+            # Analysis A2: Token-level (if --token_level and model loaded)
+            if wrapper is not None:
+                top_n_features = min(3, len(features))
+                log(f"    Token-level analysis for top-{top_n_features} features ...")
+                sub_token_reports: list[dict] = []
+                for feat in features[:top_n_features]:
+                    fidx = feat["feature_idx"]
+                    layer = feat["layer"]
+                    sae = sae_cache.get(layer)
+                    if sae is None:
+                        continue
+                    tl_report = analyze_token_level(
+                        fidx, layer, sae, wrapper, stimuli, metas,
+                        top_k_items=20, top_k_tokens=5,
+                        max_items=args.max_items,
+                    )
+                    tl_report["subgroup"] = sub
+                    tl_report["category"] = cat
+                    sub_token_reports.append(tl_report)
+                    top_tok = tl_report["token_frequency"][:5]
+                    tok_summary = ", ".join(f'"{t["token"]}"({t["count"]})'
+                                            for t in top_tok)
+                    log(f"      F{fidx} L{layer}: top tokens = {tok_summary}")
+                    atomic_save_json(
+                        tl_report,
+                        output_dir / f"token_level_{cat}_{sub}_F{fidx}.json",
+                    )
+                all_token_reports.setdefault(cat, {})[sub] = sub_token_reports
+
             all_reports.extend(sub_reports)
 
         all_cooccurrence[cat] = cat_cooccurrence
@@ -725,6 +999,18 @@ def main() -> None:
     # Save cross-subgroup matrices
     atomic_save_json(cross_sub_matrices, output_dir / "cross_subgroup_activation_matrices.json")
 
+    # Save token-level reports (if any)
+    if all_token_reports:
+        # Flatten for JSON serialization
+        token_flat = {}
+        for cat, subs in all_token_reports.items():
+            token_flat[cat] = {}
+            for sub, reports in subs.items():
+                token_flat[cat][sub] = reports
+        atomic_save_json(token_flat, output_dir / "token_level_reports.json")
+        n_total = sum(len(r) for subs in all_token_reports.values() for r in subs.values())
+        log(f"Saved {n_total} token-level feature reports")
+
     # Figures
     if not args.skip_figures:
         log("\nGenerating figures ...")
@@ -739,6 +1025,9 @@ def main() -> None:
 
             if cat in all_cooccurrence:
                 fig_cooccurrence(all_cooccurrence[cat], cat, fig_dir)
+
+            if cat in all_token_reports:
+                fig_token_level(all_token_reports[cat], cat, fig_dir)
 
         if all_specificities:
             fig_specificity_distribution(all_specificities, fig_dir)
