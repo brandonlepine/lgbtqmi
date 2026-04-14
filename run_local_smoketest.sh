@@ -313,7 +313,9 @@ if [[ "${RUN_SAE}" == "1" ]]; then
   # Directories for SAE pipeline outputs
   SAE_LOCALIZATION_DIR="results/sae_localization/${MODEL_ID}/${RUN_DATE}"
   SAE_ANALYSIS_DIR="results/sae_analysis/${MODEL_ID}/${RUN_DATE}"
-  SAE_STEERING_FEATURES_DIR="results/steering_features/${MODEL_ID}"
+  SAE_STEERING_FEATURES_DIR="results/steering_features/${MODEL_ID}/${RUN_DATE}"
+  # DIM directions from the DIM pipeline run that just completed
+  SAE_DIM_DIR="${RUN_DIR}"
 
   SAE_MAX_ITEMS_ARGS=()
   if [[ -n "${MAX_ITEMS}" ]]; then
@@ -337,10 +339,8 @@ if [[ "${RUN_SAE}" == "1" ]]; then
 
   echo
   echo "----- SAE Stage 2) SAE feature analysis -----"
-  # Find the most recent localization dir
-  SAE_LOC_DIR=$(ls -td results/sae_localization/${MODEL_ID}/*/ 2>/dev/null | head -1)
-  if [[ -z "${SAE_LOC_DIR}" ]]; then
-    echo "WARNING: no SAE localization dir found, skipping SAE stages 2+"
+  if [[ ! -d "${SAE_LOCALIZATION_DIR}" ]]; then
+    echo "WARNING: SAE localization dir not found at ${SAE_LOCALIZATION_DIR}, skipping SAE stages 2+"
   else
     python scripts/run_sae_analysis.py \
       --model_path "${MODEL_PATH}" \
@@ -348,25 +348,25 @@ if [[ "${RUN_SAE}" == "1" ]]; then
       --device "${DEVICE}" \
       --sae_source "${SAE_SOURCE}" \
       --sae_expansion "${SAE_EXPANSION}" \
-      --localization_dir "${SAE_LOC_DIR}" \
+      --localization_dir "${SAE_LOCALIZATION_DIR}" \
+      --output_dir "${SAE_ANALYSIS_DIR}" \
+      --dim_dir "${SAE_DIM_DIR}" \
       "${SAE_LAYERS_ARGS[@]}" \
       "${SAE_MAX_ITEMS_ARGS[@]}"
 
-    # Find analysis dir
-    SAE_ANALYSIS_FOUND=$(ls -td results/sae_analysis/${MODEL_ID}/*/ 2>/dev/null | head -1)
-
     echo
     echo "----- SAE Stage 2b) Rank subgroup features -----"
-    if [[ -n "${SAE_ANALYSIS_FOUND}" ]]; then
-      python scripts/rank_subgroup_features.py \
-        --analysis_dir "${SAE_ANALYSIS_FOUND}" \
-        --model_id "${MODEL_ID}" \
-        "${SAE_LAYERS_ARGS[@]}"
-    fi
+    python scripts/rank_subgroup_features.py \
+      --analysis_dir "${SAE_ANALYSIS_DIR}" \
+      --model_id "${MODEL_ID}" \
+      --output_dir "${SAE_STEERING_FEATURES_DIR}" \
+      "${SAE_LAYERS_ARGS[@]}"
 
     echo
     echo "----- SAE Stage 3) Subgroup-specific steering optimization -----"
     RANKED_PATH="${SAE_STEERING_FEATURES_DIR}/ranked_features_by_subgroup.json"
+    SAE_STEERING_DIR="results/subgroup_steering/${MODEL_ID}/${RUN_DATE}"
+
     if [[ -f "${RANKED_PATH}" ]]; then
       python scripts/run_subgroup_steering.py \
         --model_path "${MODEL_PATH}" \
@@ -375,73 +375,70 @@ if [[ "${RUN_SAE}" == "1" ]]; then
         --sae_source "${SAE_SOURCE}" \
         --sae_expansion "${SAE_EXPANSION}" \
         --ranked_features "${RANKED_PATH}" \
-        --localization_dir "${SAE_LOC_DIR}" \
+        --localization_dir "${SAE_LOCALIZATION_DIR}" \
+        --output_dir "${SAE_STEERING_DIR}" \
         --categories "${SAE_CATEGORIES}" \
         --alpha_values="${SAE_ALPHA_VALUES}" \
         --k_steps "${SAE_K_STEPS}" \
         "${SAE_MAX_ITEMS_ARGS[@]}"
 
-      # Find steering dir
-      SAE_STEERING_DIR=$(ls -td results/subgroup_steering/${MODEL_ID}/*/ 2>/dev/null | head -1)
-
       echo
       echo "----- SAE Stage 4) Feature interpretability -----"
-      if [[ -n "${SAE_STEERING_DIR}" ]]; then
-        python scripts/analyze_top_features.py \
+      python scripts/analyze_top_features.py \
+        --model_path "${MODEL_PATH}" \
+        --model_id "${MODEL_ID}" \
+        --device "${DEVICE}" \
+        --sae_source "${SAE_SOURCE}" \
+        --sae_expansion "${SAE_EXPANSION}" \
+        --steering_dir "${SAE_STEERING_DIR}" \
+        --localization_dir "${SAE_LOCALIZATION_DIR}" \
+        --ranked_features "${RANKED_PATH}" \
+        --categories "${SAE_CATEGORIES}" \
+        --token_level \
+        "${SAE_MAX_ITEMS_ARGS[@]}"
+
+      echo
+      echo "----- SAE Stage 5) Universal backfire prediction -----"
+      python scripts/analyze_universal_backfire.py \
+        --model_path "${MODEL_PATH}" \
+        --model_id "${MODEL_ID}" \
+        --device "${DEVICE}" \
+        --sae_source "${SAE_SOURCE}" \
+        --sae_expansion "${SAE_EXPANSION}" \
+        --steering_dir "${SAE_STEERING_DIR}" \
+        --ranked_features "${RANKED_PATH}" \
+        --localization_dir "${SAE_LOCALIZATION_DIR}" \
+        --categories "${SAE_CATEGORIES}" \
+        "${SAE_MAX_ITEMS_ARGS[@]}"
+
+      echo
+      echo "----- SAE Stage 6) Probe selectivity controls -----"
+      python scripts/run_probe_controls.py \
+        --localization_dir "${SAE_LOCALIZATION_DIR}" \
+        --categories "${SAE_CATEGORIES}"
+
+      echo
+      echo "----- SAE Stage 7) Generalization evaluation (MedQA + MMLU) -----"
+      GEN_ARGS=()
+      if [[ -d "${MEDQA_PATH}" ]]; then
+        GEN_ARGS+=(--medqa_path "${MEDQA_PATH}")
+      fi
+      if [[ -d "${MMLU_PATH}" ]]; then
+        GEN_ARGS+=(--mmlu_path "${MMLU_PATH}")
+      fi
+      if [[ ${#GEN_ARGS[@]} -gt 0 ]]; then
+        python scripts/evaluate_generalization.py \
           --model_path "${MODEL_PATH}" \
           --model_id "${MODEL_ID}" \
           --device "${DEVICE}" \
           --sae_source "${SAE_SOURCE}" \
           --sae_expansion "${SAE_EXPANSION}" \
           --steering_dir "${SAE_STEERING_DIR}" \
-          --localization_dir "${SAE_LOC_DIR}" \
-          --ranked_features "${RANKED_PATH}" \
           --categories "${SAE_CATEGORIES}" \
+          "${GEN_ARGS[@]}" \
           "${SAE_MAX_ITEMS_ARGS[@]}"
-
-        echo
-        echo "----- SAE Stage 5) Universal backfire prediction -----"
-        python scripts/analyze_universal_backfire.py \
-          --model_path "${MODEL_PATH}" \
-          --model_id "${MODEL_ID}" \
-          --device "${DEVICE}" \
-          --sae_source "${SAE_SOURCE}" \
-          --sae_expansion "${SAE_EXPANSION}" \
-          --steering_dir "${SAE_STEERING_DIR}" \
-          --ranked_features "${RANKED_PATH}" \
-          --localization_dir "${SAE_LOC_DIR}" \
-          --categories "${SAE_CATEGORIES}" \
-          "${SAE_MAX_ITEMS_ARGS[@]}"
-
-        echo
-        echo "----- SAE Stage 6) Probe selectivity controls -----"
-        python scripts/run_probe_controls.py \
-          --localization_dir "${SAE_LOC_DIR}" \
-          --categories "${SAE_CATEGORIES}"
-
-        echo
-        echo "----- SAE Stage 7) Generalization evaluation (MedQA + MMLU) -----"
-        GEN_ARGS=()
-        if [[ -d "${MEDQA_PATH}" ]]; then
-          GEN_ARGS+=(--medqa_path "${MEDQA_PATH}")
-        fi
-        if [[ -d "${MMLU_PATH}" ]]; then
-          GEN_ARGS+=(--mmlu_path "${MMLU_PATH}")
-        fi
-        if [[ ${#GEN_ARGS[@]} -gt 0 ]]; then
-          python scripts/evaluate_generalization.py \
-            --model_path "${MODEL_PATH}" \
-            --model_id "${MODEL_ID}" \
-            --device "${DEVICE}" \
-            --sae_source "${SAE_SOURCE}" \
-            --sae_expansion "${SAE_EXPANSION}" \
-            --steering_dir "${SAE_STEERING_DIR}" \
-            --categories "${SAE_CATEGORIES}" \
-            "${GEN_ARGS[@]}" \
-            "${SAE_MAX_ITEMS_ARGS[@]}"
-        else
-          echo "  Skipping: neither MEDQA_PATH nor MMLU_PATH found"
-        fi
+      else
+        echo "  Skipping: neither MEDQA_PATH nor MMLU_PATH found"
       fi
     else
       echo "WARNING: ranked features not found at ${RANKED_PATH}, skipping stages 3+"

@@ -41,14 +41,18 @@ def _require_pandas() -> None:
 def find_dim_directions(
     run_dirs: list[Path],
 ) -> dict[str, np.ndarray]:
-    """Scan run directories for DIM direction .npy files.
+    """Scan run directories for DIM direction files (.npy or .npz).
+
+    Supports both individual ``.npy`` files (e.g. ``direction_so.npy``)
+    and bundled ``.npz`` archives (e.g. ``directions.npz`` from
+    ``compute_directions.py`` with keys like ``direction_so``).
 
     Returns dict mapping a label (e.g. ``"so"``) to direction vector
     of shape ``(hidden_dim,)``.  Returns empty dict if nothing found.
     """
     directions: dict[str, np.ndarray] = {}
 
-    patterns = [
+    npy_patterns = [
         "dim_direction_*.npy",
         "direction_*.npy",
         "*_direction.npy",
@@ -58,9 +62,10 @@ def find_dim_directions(
     for rd in run_dirs:
         if not rd.is_dir():
             continue
-        for pat in patterns:
+
+        # Scan for individual .npy files
+        for pat in npy_patterns:
             for f in rd.glob(pat):
-                # Extract label from filename
                 stem = f.stem
                 for prefix in ("dim_direction_", "direction_", "bias_direction_"):
                     if stem.startswith(prefix):
@@ -76,6 +81,27 @@ def find_dim_directions(
                         log(f"  Found DIM direction: {label} from {f}")
                 except Exception as exc:
                     log(f"  WARNING: failed to load {f}: {exc}")
+
+        # Scan for bundled .npz archives (e.g. analysis/directions.npz)
+        for npz_path in rd.glob("**/directions.npz"):
+            try:
+                data = np.load(npz_path, allow_pickle=True)
+                for key in data.files:
+                    if key.startswith("_"):
+                        continue  # skip metadata keys
+                    arr = data[key]
+                    if not isinstance(arr, np.ndarray) or arr.ndim != 1:
+                        continue
+                    # Extract label: "direction_so" -> "so", "subgroup_so_gay" -> "so_gay"
+                    label = key
+                    for prefix in ("direction_", "subgroup_"):
+                        if key.startswith(prefix):
+                            label = key[len(prefix):]
+                            break
+                    directions[label] = arr.astype(np.float32)
+                    log(f"  Found DIM direction: {label} from {npz_path}")
+            except Exception as exc:
+                log(f"  WARNING: failed to load {npz_path}: {exc}")
 
     return directions
 
