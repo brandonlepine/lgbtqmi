@@ -201,10 +201,14 @@ def run_random_trials(
                 f"flip={n_flipped}/{n_items} ({rec['flip_rate']:.3f})")
 
         # Memory cleanup
-        if hasattr(torch, "mps") and hasattr(torch.mps, "empty_cache"):
-            torch.mps.empty_cache()
-        elif torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        # Only clear the cache for the active backend.
+        dev = str(device).lower()
+        if dev == "mps":
+            if hasattr(torch, "mps") and hasattr(torch.mps, "empty_cache"):
+                torch.mps.empty_cache()
+        elif dev.startswith("cuda"):
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
     # Save per-item results for the designated trial
     if per_item_records and output_dir:
