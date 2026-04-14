@@ -117,7 +117,7 @@ def _phase1_prune_alphas(
 ) -> list[float]:
     """Phase 1: run k=1 across all alphas to prune non-viable ones.
 
-    Viable = RCR_1.0 > 0 and degeneration < 0.05.
+    Viable = RCR_1.0 > 0 AND corruption < 0.05 AND degeneration < 0.05.
     If fewer than 3 are viable, keep all.
     """
     from src.metrics.bias_metrics import compute_margin, compute_rcr
@@ -145,6 +145,7 @@ def _phase1_prune_alphas(
 
         item_results: list[dict] = []
         n_degen = 0
+        n_corrupted = 0
         for item in items:
             prompt = prompt_formatter(item)
             baseline = steerer.evaluate_baseline(prompt)
@@ -162,6 +163,12 @@ def _phase1_prune_alphas(
                 orig_role == "stereotyped_target"
                 and steered_role in ("non_stereotyped", "unknown")
             )
+            corrupted = (
+                orig_role == "non_stereotyped"
+                and steered_role == "stereotyped_target"
+            )
+            if corrupted:
+                n_corrupted += 1
 
             logits_b = baseline.get("answer_logits", {})
             try:
@@ -172,13 +179,16 @@ def _phase1_prune_alphas(
 
             item_results.append({"corrected": corrected, "margin": margin})
 
-        degen_rate = n_degen / max(len(items), 1)
+        n = max(len(items), 1)
+        degen_rate = n_degen / n
+        corrupt_rate = n_corrupted / n
         rcr_result = compute_rcr(item_results, tau=1.0)
-        is_viable = rcr_result["rcr"] > 0 and degen_rate < 0.05
+        is_viable = rcr_result["rcr"] > 0 and corrupt_rate < 0.05 and degen_rate < 0.05
 
         rec = {
             "alpha": alpha,
             "rcr_1.0": rcr_result["rcr"],
+            "corruption_rate": corrupt_rate,
             "degeneration_rate": degen_rate,
             "viable": is_viable,
         }
@@ -186,7 +196,8 @@ def _phase1_prune_alphas(
 
         if is_viable:
             viable.append(alpha)
-        log(f"      alpha={alpha}: RCR={rcr_result['rcr']:.3f} degen={degen_rate:.3f} "
+        log(f"      alpha={alpha}: RCR={rcr_result['rcr']:.3f} "
+            f"corrupt={corrupt_rate:.3f} degen={degen_rate:.3f} "
             f"{'VIABLE' if is_viable else 'pruned'}")
 
     if len(viable) < 3:
@@ -375,18 +386,26 @@ def main() -> None:
                 log(f"  Skipping {sub}: no pro-bias features")
                 continue
 
-            # Filter items targeting this subgroup (stereotyped only)
+            # Filter items targeting this subgroup — include ALL behavioral
+            # outcomes (stereotyped, non-stereotyped, unknown) so the sweep
+            # can measure both correction AND corruption.
             sub_items = [
                 it for it in items
-                if it.get("model_answer_role") == "stereotyped_target"
-                and sub in it.get("stereotyped_groups", [])
+                if sub in it.get("stereotyped_groups", [])
+                and it.get("model_answer_role")  # must have behavioral annotation
             ]
             if args.max_items:
                 sub_items = sub_items[:args.max_items]
 
-            if len(sub_items) < 3:
-                log(f"  Skipping {sub}: only {len(sub_items)} stereotyped items")
+            n_stereo = sum(1 for it in sub_items
+                           if it.get("model_answer_role") == "stereotyped_target")
+            if n_stereo < 3:
+                log(f"  Skipping {sub}: only {n_stereo} stereotyped items "
+                    f"(of {len(sub_items)} total)")
                 continue
+
+            log(f"  {sub}: {len(sub_items)} items "
+                f"({n_stereo} stereotyped, {len(sub_items) - n_stereo} non-stereo/unknown)")
 
             # Phase 1: alpha pruning
             viable_alphas = _phase1_prune_alphas(
