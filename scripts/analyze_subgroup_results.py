@@ -309,6 +309,9 @@ def plot_fig66(probe_data: dict, fig_dir: str) -> None:
         return
 
     total_sgs = sum(len(probe_data[c]["probe_s2"]) for c in available)
+    if total_sgs == 0:
+        log("  No subgroups with S2 probe data, skipping fig_66")
+        return
     ncols = min(total_sgs, 6)
     fig, axes = plt.subplots(1, ncols, figsize=(ncols * 3.5, 5), sharey=True)
     if ncols == 1:
