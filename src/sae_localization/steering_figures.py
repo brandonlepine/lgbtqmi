@@ -295,7 +295,11 @@ def fig_medqa_demographic(
     exp_e: dict[str, Any],
     output_dir: Path,
 ) -> None:
-    """Bar chart: MedQA accuracy on demographic items (annotate flip rates)."""
+    """Legacy bar chart: MedQA accuracy split by demographic flag.
+
+    This is a *global pooled steering* view and is not subgroup-conditioned.
+    Prefer `fig_medqa_subgroup_conditional` when available.
+    """
     medqa = exp_e.get("medqa", {})
     if not medqa:
         return
@@ -327,11 +331,73 @@ def fig_medqa_demographic(
     ax.set_xticks(x)
     ax.set_xticklabels(labels, fontsize=10)
     ax.set_ylabel("Accuracy")
-    ax.set_title("MedQA accuracy under bias steering")
+    ax.set_title("MedQA accuracy (LEGACY: global pooled steering)")
     ax.legend()
 
     _save_both(fig, output_dir / "fig_medqa_demographic.png")
     log("    Saved fig_medqa_demographic")
+
+
+# ---------------------------------------------------------------------------
+# Figure 25b: MedQA subgroup-conditioned controls (preferred)
+# ---------------------------------------------------------------------------
+
+
+def fig_medqa_subgroup_conditional(
+    exp_e: dict[str, Any],
+    output_dir: Path,
+) -> None:
+    """Summary of subgroup-conditioned MedQA steering + controls (E2b).
+
+    Plots Δ accuracy and flip rate for:
+    - matched_suppress / matched_amplify
+    - mismatched_suppress / mismatched_amplify
+    - random_on_untagged_suppress / random_on_untagged_amplify
+    """
+    rows = exp_e.get("medqa_subgroup_conditional", None)
+    if not rows:
+        return
+
+    # Stable condition order
+    order = [
+        "matched_suppress",
+        "matched_amplify",
+        "mismatched_suppress",
+        "mismatched_amplify",
+        "random_on_untagged_suppress",
+        "random_on_untagged_amplify",
+    ]
+    rows2 = [r for r in rows if r.get("condition") in order]
+    if not rows2:
+        return
+    rows2.sort(key=lambda r: order.index(r.get("condition")))
+
+    labels = [r["condition"].replace("_", "\n") for r in rows2]
+    deltas = [float(r.get("delta", 0.0)) for r in rows2]
+    flips = [float(r.get("flip_rate", 0.0)) for r in rows2]
+    ns = [int(r.get("n_items", 0)) for r in rows2]
+    demo_mode = rows2[0].get("demo_mode", "unknown")
+
+    x = np.arange(len(labels))
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(9, 7), sharex=True)
+
+    # Delta bars
+    colors = [GREEN if d > 0 else VERMILLION for d in deltas]
+    ax1.bar(x, deltas, color=colors, alpha=0.8)
+    ax1.axhline(0, color=GRAY, lw=0.8)
+    ax1.set_ylabel("Δ accuracy (steered − baseline)")
+    ax1.set_title(f"MedQA subgroup-conditioned steering + controls (demo_mode={demo_mode})")
+    for i in range(len(x)):
+        ax1.text(x[i], deltas[i] + (0.002 if deltas[i] >= 0 else -0.002), f"n={ns[i]}", ha="center", va="bottom" if deltas[i] >= 0 else "top", fontsize=8, color=GRAY)
+
+    # Flip rate bars
+    ax2.bar(x, flips, color=BLUE, alpha=0.7)
+    ax2.set_ylabel("Flip rate")
+    ax2.set_xticks(x)
+    ax2.set_xticklabels(labels, fontsize=8)
+
+    _save_both(fig, output_dir / "fig_medqa_subgroup_conditional.png")
+    log("    Saved fig_medqa_subgroup_conditional")
 
 
 # ---------------------------------------------------------------------------
@@ -356,7 +422,13 @@ def fig_experiment_summary(
     for c in cats:
         corr = exp_a.get(c, {}).get("optimal_rates", {}).get("correction_rate", 0)
         corrupt = exp_b.get(c, {}).get("optimal_rates", {}).get("corruption_rate", 0)
-        mmlu_d = summary.get("experiment_E", {}).get("mmlu", {}).get("delta", 0)
+        exp_e = summary.get("experiment_E", {}) or {}
+        mmlu_by_cat = exp_e.get("mmlu_by_category", {}) if isinstance(exp_e, dict) else {}
+        if isinstance(mmlu_by_cat, dict) and c in mmlu_by_cat:
+            mmlu_d = mmlu_by_cat[c].get("delta", 0)
+        else:
+            # Fallback: global Experiment E delta (same for all categories)
+            mmlu_d = exp_e.get("mmlu", {}).get("delta", 0) if isinstance(exp_e, dict) else 0
         rows.append([CATEGORY_LABELS.get(c, c), f"{corr:.3f}", f"{corrupt:.3f}", f"{mmlu_d:+.3f}"])
 
     fig, ax = plt.subplots(figsize=(8, max(3, len(rows) * 0.5 + 1)))
@@ -532,6 +604,9 @@ def generate_all_steering_figures(
     # Fig 25: MedQA
     if exp_e and "medqa" in exp_e:
         fig_medqa_demographic(exp_e, fig_dir)
+    # Fig 25b: MedQA subgroup-conditioned controls (preferred)
+    if exp_e and "medqa_subgroup_conditional" in exp_e:
+        fig_medqa_subgroup_conditional(exp_e, fig_dir)
 
     # Fig 26: Summary table
     fig_experiment_summary(summary, fig_dir)

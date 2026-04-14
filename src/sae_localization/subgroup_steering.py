@@ -93,6 +93,16 @@ def build_subgroup_steering_vector(
         Number of top features to use.
     alpha : float
         Steering coefficient (negative to dampen, positive to amplify).
+
+        .. note:: Magnitude convention — this function takes the mean of
+           unit-normalised decoder columns then multiplies by alpha, so
+           perturbation magnitude is ~alpha/sqrt(k) for k features.  This
+           differs from ``SAESteerer.get_composite_steering()`` in
+           ``steering.py``, which applies alpha/sqrt(n) per feature then sums
+           (magnitude ~alpha * sqrt(k)).  Same alpha value produces different
+           perturbation magnitudes by factor of k.  Do NOT compare alpha values
+           across these two conventions.
+
     device, dtype : torch device/dtype for the output.
 
     Returns
@@ -154,13 +164,18 @@ def run_stepwise_sweep(
     """Run the k × alpha grid for one subgroup.
 
     Returns dict with ``grid`` (list of per-(k,alpha) result dicts),
-    ``optimal`` config, and ``margin_bins`` breakdown.
+    ``optimal`` config, ``per_item_records`` (list of per-item dicts for
+    the optimal (k,alpha) configuration), and ``margin_bins`` breakdown.
     """
+    from src.metrics.bias_metrics import compute_all_metrics, compute_margin
     from src.sae_localization.steering import SAESteerer
 
     grid: list[dict[str, Any]] = []
-    best_correction = -1.0
+    best_eta = -1.0
     best_config: dict[str, Any] = {}
+
+    # Per-item records keyed by (k, alpha) for the optimal config
+    per_item_by_config: dict[tuple[int, float], list[dict[str, Any]]] = {}
 
     n_items = len(items)
     log(f"    Sweep {category}/{subgroup}: {n_items} items, "
@@ -177,11 +192,12 @@ def run_stepwise_sweep(
                 with open(ckpt_path) as f:
                     rec = json.load(f)
                 grid.append(rec)
-                # Check optimality
-                cr = rec.get("correction_rate", 0)
-                corr_rate = rec.get("corruption_rate", 0)
-                if cr > best_correction and corr_rate < 0.05:
-                    best_correction = cr
+                # Check optimality via eta
+                eta = rec.get("eta", 0.0)
+                if (rec.get("corruption_rate", 1) < 0.05
+                        and rec.get("degeneration_rate", 1) < 0.05
+                        and eta > best_eta):
+                    best_eta = eta
                     best_config = rec
                 continue
 
@@ -189,6 +205,7 @@ def run_stepwise_sweep(
                 feature_list, sae_cache, k, alpha,
                 device=wrapper.device, dtype=wrapper.model.dtype,
             )
+            vec_norm = float(vec.float().norm())
 
             # Build a temporary steerer at the injection layer
             first_sae = sae_cache.get(inj_layer, next(iter(sae_cache.values())))
@@ -198,9 +215,10 @@ def run_stepwise_sweep(
             n_corrupted = 0
             n_unknown = 0
             n_degen = 0
-            margin_bins: dict[str, dict[str, int]] = {
+            margin_bins_acc: dict[str, dict[str, int]] = {
                 b[0]: {"n": 0, "corrected": 0} for b in MARGIN_BINS
             }
+            item_records: list[dict[str, Any]] = []
 
             for item in items:
                 prompt = prompt_formatter(item)
@@ -212,32 +230,78 @@ def run_stepwise_sweep(
                 orig_role = item.get("answer_roles", {}).get(orig, "unknown")
                 steered_role = item.get("answer_roles", {}).get(steered_ans, "unknown")
 
-                flipped = orig != steered_ans
                 if result["degenerated"]:
                     n_degen += 1
 
-                # Correction: was stereotyped, now non-stereo/unknown
-                if orig_role == "stereotyped_target" and steered_role in ("non_stereotyped", "unknown"):
+                corrected = (
+                    orig_role == "stereotyped_target"
+                    and steered_role in ("non_stereotyped", "unknown")
+                )
+                corrupted = (
+                    orig_role == "non_stereotyped"
+                    and steered_role == "stereotyped_target"
+                )
+                if corrected:
                     n_corrected += 1
-                # Corruption: was non-stereo, now stereotyped
-                if orig_role == "non_stereotyped" and steered_role == "stereotyped_target":
+                if corrupted:
                     n_corrupted += 1
                 if steered_role == "unknown":
                     n_unknown += 1
 
-                # Margin bin
-                logits = baseline.get("answer_logits", {})
+                # Compute margin from baseline logits
+                logits_b = baseline.get("answer_logits", {})
+                logits_s = result.get("answer_logits", {})
                 try:
-                    vals = {lk: float(lv) for lk, lv in logits.items()}
-                    top = vals.get(orig, 0)
-                    others = [v for lk, v in vals.items() if lk != orig]
-                    margin = top - max(others) if others else 0
+                    logits_b_float = {lk: float(lv) for lk, lv in logits_b.items()}
+                    margin = compute_margin(logits_b_float, orig) if orig in logits_b_float else 0.0
                 except (ValueError, TypeError):
-                    margin = 0
+                    logits_b_float = {}
+                    margin = 0.0
+                try:
+                    logits_s_float = {lk: float(lv) for lk, lv in logits_s.items()}
+                except (ValueError, TypeError):
+                    logits_s_float = {}
+
                 mbin = _bin_margin(margin)
-                margin_bins[mbin]["n"] += 1
-                if orig_role == "stereotyped_target" and steered_role in ("non_stereotyped", "unknown"):
-                    margin_bins[mbin]["corrected"] += 1
+                margin_bins_acc[mbin]["n"] += 1
+                if corrected:
+                    margin_bins_acc[mbin]["corrected"] += 1
+
+                # Determine stereotyped option
+                answer_roles = item.get("answer_roles", {})
+                stereo_opt = ""
+                for letter, role in answer_roles.items():
+                    if role == "stereotyped_target":
+                        stereo_opt = letter
+                        break
+
+                item_records.append({
+                    "item_idx": item.get("item_idx", -1),
+                    "category": category,
+                    "subgroup": subgroup,
+                    "k": k,
+                    "alpha": alpha,
+                    "baseline_answer": orig,
+                    "steered_answer": steered_ans,
+                    "baseline_role": orig_role,
+                    "steered_role": steered_role,
+                    "corrected": corrected,
+                    "corrupted": corrupted,
+                    "margin": margin,
+                    "margin_bin": mbin,
+                    "logit_baseline": logits_b_float,
+                    "logit_steered": logits_s_float,
+                    "stereotyped_option": stereo_opt,
+                    "degenerated": result["degenerated"],
+                    "vector_norm": vec_norm,
+                })
+
+            # Compute confidence-aware metrics
+            metrics = compute_all_metrics(item_records)
+
+            # Compute steering efficiency eta
+            rcr_1 = metrics.get("rcr_1.0", {}).get("rcr", 0.0)
+            eta = rcr_1 / max(vec_norm, 1e-8)
 
             rec = {
                 "category": category,
@@ -254,13 +318,16 @@ def run_stepwise_sweep(
                 "corruption_rate": n_corrupted / max(n_items, 1),
                 "unknown_rate": n_unknown / max(n_items, 1),
                 "degeneration_rate": n_degen / max(n_items, 1),
+                "vector_norm": vec_norm,
+                "eta": eta,
+                "metrics": metrics,
                 "margin_bins": {
                     mb: {
                         "n": d["n"],
                         "corrected": d["corrected"],
                         "correction_rate": d["corrected"] / max(d["n"], 1),
                     }
-                    for mb, d in margin_bins.items()
+                    for mb, d in margin_bins_acc.items()
                 },
                 "features_used": [
                     {"feature_idx": f["feature_idx"], "layer": f["layer"]}
@@ -270,14 +337,19 @@ def run_stepwise_sweep(
             grid.append(rec)
             atomic_save_json(rec, ckpt_path)
 
-            cr = rec["correction_rate"]
-            corr_r = rec["corruption_rate"]
-            if cr > best_correction and corr_r < 0.05:
-                best_correction = cr
+            # Store per-item records for potential optimal
+            per_item_by_config[(k, alpha)] = item_records
+
+            if (rec["corruption_rate"] < 0.05
+                    and rec["degeneration_rate"] < 0.05
+                    and eta > best_eta):
+                best_eta = eta
                 best_config = rec
 
-            log(f"      k={k} alpha={alpha}: corr={cr:.3f} corrupt={corr_r:.3f} "
-                f"degen={rec['degeneration_rate']:.3f}")
+            log(f"      k={k} alpha={alpha}: corr={rec['correction_rate']:.3f} "
+                f"corrupt={rec['corruption_rate']:.3f} "
+                f"degen={rec['degeneration_rate']:.3f} "
+                f"eta={eta:.3f} ||v||={vec_norm:.3f}")
 
         # Memory cleanup
         if hasattr(torch, "mps") and hasattr(torch.mps, "empty_cache"):
@@ -285,22 +357,31 @@ def run_stepwise_sweep(
         elif torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-    # Tie-break: among configs within 0.005 of best, prefer smaller |alpha| then smaller k
+    # Tie-break: among configs within 1% of best eta, prefer smaller ||v||
     if grid:
         eligible = [
             r for r in grid
             if r["corruption_rate"] < 0.05
-            and r["correction_rate"] >= (best_correction - 0.005)
+            and r.get("degeneration_rate", 0) < 0.05
+            and r.get("eta", 0) >= (best_eta * 0.99)
         ]
         if eligible:
-            eligible.sort(key=lambda r: (abs(r["alpha"]), r["k"], -r["correction_rate"]))
+            eligible.sort(key=lambda r: (
+                r.get("vector_norm", float("inf")),
+                -r.get("eta", 0),
+            ))
             best_config = eligible[0]
+
+    # Get per-item records for the optimal config
+    opt_key = (best_config.get("k", 0), best_config.get("alpha", 0))
+    optimal_per_item = per_item_by_config.get(opt_key, [])
 
     return {
         "category": category,
         "subgroup": subgroup,
         "grid": grid,
         "optimal": best_config,
+        "per_item_records": optimal_per_item,
     }
 
 

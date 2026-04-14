@@ -11,7 +11,13 @@ Supported local formats:
 - JSONL with the same schemas
 
 Output items are normalized to:
-  { "prompt": str, "answer": "A"|...|"E", "letters": tuple[str,...], "mentions_demographic": bool }
+  {
+    "prompt": str,
+    "answer": "A"|...|"E",
+    "letters": tuple[str,...],
+    "demographic_tags": list[str],  # tags aligned to BBQ subgroup names when possible
+    "mentions_demographic": bool,   # bool(demographic_tags)
+  }
 """
 
 from __future__ import annotations
@@ -42,33 +48,113 @@ def _format_medqa_prompt(question: str, options: dict[str, str]) -> str:
     return "\n".join(lines)
 
 
-def _mentions_demographic(text: str) -> bool:
-    """Heuristic: does the prompt explicitly mention a social identity category?
+def _demographic_tags(text: str, *, mode: str = "narrow") -> list[str]:
+    """Extract demographic tags from a prompt.
 
-    This is intentionally *narrow* to avoid flagging most MedQA items (e.g., "67-year-old"
-    would otherwise mark nearly everything as demographic).
+    - mode="narrow": identity-category mentions (religion, SO/GI, race/ethnicity, etc.)
+    - mode="broad": also includes age + binary sex terms, which will tag many MedQA items.
+
+    Tags are chosen to align with BBQ subgroup names where possible (e.g., "F", "M", "old", "nonOld",
+    "Muslim", "Jewish", "gay", "lesbian", ...).
     """
     import re
 
     t = text.lower()
+    tags: list[str] = []
 
-    patterns = [
-        # Sexual orientation / gender identity
-        r"\b(gay|lesbian|bisexual|pansexual)\b",
-        r"\b(transgender|cisgender|nonbinary|non-binary)\b",
-        # Use word boundary to avoid false positives like "transport"
-        r"\btrans\b",
-        r"\bcis\b",
-        # Religion (explicit labels)
-        r"\b(muslim|jewish|christian|catholic|hindu|mormon|orthodox|atheist)\b",
-        # Race/ethnicity (prefer multi-word labels to avoid medical “black/white” false positives)
-        r"\b(african american|native american|middle eastern|latino|hispanic|arab)\b",
-        # Disability / physical difference (these are closer to our BBQ categories)
-        r"\b(autistic|blind|deaf|wheelchair)\b",
-        r"\b(down['’]s syndrome)\b",
-    ]
+    def has(pat: str) -> bool:
+        return re.search(pat, t) is not None
 
-    return any(re.search(p, t) for p in patterns)
+    # Sexual orientation (BBQ SO subgroups are lower-case)
+    if has(r"\b(bisexual)\b"):
+        tags.append("bisexual")
+    if has(r"\b(gay)\b"):
+        tags.append("gay")
+    if has(r"\b(lesbian)\b"):
+        tags.append("lesbian")
+    if has(r"\b(pansexual)\b"):
+        tags.append("pansexual")
+    if has(r"\b(straight|heterosexual)\b"):
+        tags.append("straight")
+
+    # Gender identity (mix of subgroup labels appears in BBQ)
+    if has(r"\b(transgender women|trans woman|transgender woman)\b"):
+        tags.append("Transgender women")
+    if has(r"\b(transgender men|trans man|transgender man)\b"):
+        tags.append("transgender men")
+    if has(r"\b(transgender|nonbinary|non-binary|cisgender)\b"):
+        tags.append("trans")
+
+    # Religion (capitalize to match BBQ subgroup labels)
+    if has(r"\b(atheist|atheism)\b"):
+        tags.append("Atheist")
+    if has(r"\b(catholic)\b"):
+        tags.append("Catholic")
+    if has(r"\b(christian)\b"):
+        tags.append("Christian")
+    if has(r"\b(jewish)\b"):
+        tags.append("Jewish")
+    if has(r"\b(mormon)\b"):
+        tags.append("Mormon")
+    if has(r"\b(muslim|islam)\b"):
+        tags.append("Muslim")
+    if has(r"\b(orthodox)\b"):
+        tags.append("Orthodox")
+    if has(r"\b(hindu)\b"):
+        tags.append("Hindu")
+
+    # Race/ethnicity (prefer multi-word labels)
+    if has(r"\b(african american)\b"):
+        tags.append("African American")
+    if has(r"\b(native american)\b"):
+        tags.append("Native American")
+    if has(r"\b(middle eastern)\b"):
+        tags.append("Middle Eastern")
+    if has(r"\b(latino)\b"):
+        tags.append("Latino")
+    if has(r"\b(hispanic)\b"):
+        tags.append("Hispanic")
+    if has(r"\b(arab)\b"):
+        tags.append("Arab")
+
+    # Disability/physical difference
+    if has(r"\b(autistic)\b"):
+        tags.append("autistic people")
+    if has(r"\b(blind)\b"):
+        tags.append("people with blindness or low-vision")
+    if has(r"\b(deaf)\b"):
+        tags.append("D/deaf")
+    if has(r"\b(down['’]s syndrome)\b"):
+        tags.append("Down's syndrome")
+    if has(r"\b(wheelchair)\b"):
+        tags.append("physically disabled")
+
+    if mode == "broad":
+        # Binary sex markers -> GI subgroups F/M
+        if has(r"\b(female|woman|girl)\b"):
+            tags.append("F")
+        if has(r"\b(male|man|boy)\b"):
+            tags.append("M")
+
+        # Age markers -> age subgroups old/nonOld
+        m = re.search(r"\b(\d{1,3})-year-old\b", t)
+        if m:
+            try:
+                age = int(m.group(1))
+                tags.append("old" if age >= 60 else "nonOld")
+            except Exception:
+                pass
+        if has(r"\b(elderly|geriatric)\b"):
+            tags.append("old")
+
+    # Deduplicate while keeping order
+    seen: set[str] = set()
+    out: list[str] = []
+    for x in tags:
+        if x not in seen:
+            out.append(x)
+            seen.add(x)
+    return out
 
 
 def _iter_jsonl(path: Path) -> Iterable[dict[str, Any]]:
@@ -80,7 +166,11 @@ def _iter_jsonl(path: Path) -> Iterable[dict[str, Any]]:
             yield json.loads(line)
 
 
-def _iter_medqa_from_objects(objs: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
+def _iter_medqa_from_objects(
+    objs: Iterable[dict[str, Any]],
+    *,
+    demographic_mode: str = "narrow",
+) -> list[dict[str, Any]]:
     items: list[dict[str, Any]] = []
     for obj in objs:
         q = obj.get("question", "") or obj.get("prompt", "")
@@ -115,18 +205,20 @@ def _iter_medqa_from_objects(objs: Iterable[dict[str, Any]]) -> list[dict[str, A
 
         prompt = _format_medqa_prompt(str(q), options)
         letters = tuple(sorted(options.keys()))
+        demo_tags = _demographic_tags(prompt, mode=demographic_mode)
         items.append(
             {
                 "prompt": prompt,
                 "answer": ans,
                 "letters": letters,
-                "mentions_demographic": _mentions_demographic(prompt),
+                "demographic_tags": demo_tags,
+                "mentions_demographic": bool(demo_tags),
             }
         )
     return items
 
 
-def _load_parquet(path: Path) -> list[dict[str, Any]]:
+def _load_parquet(path: Path, *, demographic_mode: str = "narrow") -> list[dict[str, Any]]:
     try:
         import pandas as pd  # type: ignore
     except ImportError as exc:
@@ -140,23 +232,28 @@ def _load_parquet(path: Path) -> list[dict[str, Any]]:
         raise ValueError(f"Unsupported MedQA parquet schema in {path}; columns={sorted(cols)}")
 
     objs = df.to_dict(orient="records")
-    return _iter_medqa_from_objects(objs)
+    return _iter_medqa_from_objects(objs, demographic_mode=demographic_mode)
 
 
-def load_medqa_items(path: str | Path, *, max_items: int | None = None) -> list[dict[str, Any]]:
+def load_medqa_items(
+    path: str | Path,
+    *,
+    max_items: int | None = None,
+    demographic_mode: str = "narrow",
+) -> list[dict[str, Any]]:
     p = Path(path)
     items: list[dict[str, Any]] = []
 
     if p.is_file():
         if p.suffix.lower() == ".parquet":
-            items.extend(_load_parquet(p))
+            items.extend(_load_parquet(p, demographic_mode=demographic_mode))
         elif p.suffix.lower() == ".jsonl":
-            items.extend(_iter_medqa_from_objects(_iter_jsonl(p)))
+            items.extend(_iter_medqa_from_objects(_iter_jsonl(p), demographic_mode=demographic_mode))
         elif p.suffix.lower() == ".json":
             data = json.loads(p.read_text(encoding="utf-8"))
             if not isinstance(data, list):
                 raise ValueError(f"Unsupported JSON structure in {p} (expected list)")
-            items.extend(_iter_medqa_from_objects(data))
+            items.extend(_iter_medqa_from_objects(data, demographic_mode=demographic_mode))
         else:
             raise ValueError(f"Unsupported MedQA file type: {p.suffix}")
     elif p.is_dir():
@@ -165,7 +262,7 @@ def load_medqa_items(path: str | Path, *, max_items: int | None = None) -> list[
         json_files = sorted(p.rglob("*.json"))
 
         for f in parquet_files:
-            items.extend(_load_parquet(f))
+            items.extend(_load_parquet(f, demographic_mode=demographic_mode))
             if max_items is not None and len(items) >= max_items:
                 break
         if (max_items is None) or (len(items) < max_items):
@@ -179,14 +276,14 @@ def load_medqa_items(path: str | Path, *, max_items: int | None = None) -> list[
             ordered_jsonl = preferred + [f for f in jsonl_files if f.resolve() not in preferred_set]
 
             for f in ordered_jsonl:
-                items.extend(_iter_medqa_from_objects(_iter_jsonl(f)))
+                items.extend(_iter_medqa_from_objects(_iter_jsonl(f), demographic_mode=demographic_mode))
                 if max_items is not None and len(items) >= max_items:
                     break
         if (max_items is None) or (len(items) < max_items):
             for f in json_files:
                 data = json.loads(f.read_text(encoding="utf-8"))
                 if isinstance(data, list):
-                    items.extend(_iter_medqa_from_objects(data))
+                    items.extend(_iter_medqa_from_objects(data, demographic_mode=demographic_mode))
                 if max_items is not None and len(items) >= max_items:
                     break
     else:

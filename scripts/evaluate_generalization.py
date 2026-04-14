@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """Generalization evaluation: MedQA + MMLU with subgroup-specific steering vectors.
 
-Tests matched/mismatched/no-demographic conditions and bias exacerbation.
+Tests matched, within-category mismatched, cross-category mismatched,
+and no-demographic conditions.  Runs both debiasing and exacerbation
+directions by default.  Produces confidence-aware metrics and per-item
+parquet outputs.
 
 Usage
 -----
@@ -35,6 +38,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from src.metrics.bias_metrics import compute_all_metrics, compute_margin
 from src.utils.io import atomic_save_json, ensure_dir
 from src.utils.logging import log
 
@@ -43,17 +47,31 @@ try:
 except ImportError:
     pd = None
 
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from src.visualization.style import (
+    BLUE, CATEGORY_COLORS, CATEGORY_LABELS, DPI, GRAY, GREEN, ORANGE,
+    WONG_PALETTE, apply_style,
+)
+apply_style()
+
+VERMILLION = "#D55E00"
+
+
+def _save_both(fig: plt.Figure, path: Path) -> None:
+    fig.tight_layout()
+    fig.savefig(str(path), dpi=DPI, bbox_inches="tight", facecolor="white")
+    fig.savefig(str(path.with_suffix(".pdf")), bbox_inches="tight", facecolor="white")
+    plt.close(fig)
+
 
 # ---------------------------------------------------------------------------
 # Demographic classification — audit-based + regex fallback
 # ---------------------------------------------------------------------------
 
-# Pre-validated audit CSV from a prior project maps each MedQA item to
-# demographic attributes using careful heuristics.  We use it as ground
-# truth and fall back to regex only for items not covered.
 _DEFAULT_AUDIT_PATH = PROJECT_ROOT / "data" / "raw" / "medqa_demographic_audit.csv"
 
-# Audit label → BBQ subgroup name mappings
 _AUDIT_RACE_MAP: dict[str, str] = {
     "Black/African American": "African American",
     "Asian": "Asian",
@@ -85,14 +103,7 @@ def load_medqa_audit(
     """Load the pre-validated demographic audit CSV.
 
     Returns dict keyed by question-text prefix (first 100 chars, lowered)
-    → list of BBQ subgroup names.  Using text prefix as key avoids
-    reliance on positional indices that depend on file load order.
-
-    Parameters
-    ----------
-    split : str | None
-        If given, restrict to that split.  If ``None``, load all splits
-        (recommended — gives 11 k items instead of 1.3 k).
+    -> list of BBQ subgroup names.
     """
     import ast as _ast
 
@@ -108,13 +119,11 @@ def load_medqa_audit(
 
     index: dict[str, list[str]] = {}
     for _, row in df.iterrows():
-        # Key by question preview prefix (lowered, stripped) — unique enough
         preview = str(row.get("question_preview", "")).strip().lower()[:100]
         if not preview:
             continue
         subgroups: list[str] = []
 
-        # Sexual orientation
         so_raw = str(row.get("so_cues", ""))
         if "gay" in so_raw:
             subgroups.append("gay")
@@ -123,16 +132,11 @@ def load_medqa_audit(
         if "partner_same_sex" in so_raw:
             subgroups.append("gay")
 
-        # Gender identity
         if row.get("has_gender_identity_cue"):
             subgroups.append("trans")
 
-        # Race — values may be bare strings ("Black/African American")
-        # or list literals (["Black/African American"])
         races_raw = str(row.get("races", ""))
         if races_raw not in ("", "nan", "[]"):
-            # Try parsing as list literal first; fall back to treating as
-            # pipe-delimited bare string.
             race_tokens: list[str] = []
             try:
                 parsed = _ast.literal_eval(races_raw)
@@ -149,7 +153,6 @@ def load_medqa_audit(
                 if mapped:
                     subgroups.append(mapped)
 
-        # Religion
         relig_raw = str(row.get("religion_cues", ""))
         if relig_raw not in ("", "nan", "[]"):
             for token in relig_raw.split("|"):
@@ -157,7 +160,6 @@ def load_medqa_audit(
                 if mapped:
                     subgroups.append(mapped)
 
-        # Disability
         dis_raw = str(row.get("disability_cues", ""))
         if dis_raw not in ("", "nan", "[]"):
             for token in dis_raw.split("|"):
@@ -165,7 +167,6 @@ def load_medqa_audit(
                 if mapped:
                     subgroups.append(mapped)
 
-        # Pregnancy / physical appearance
         preg_raw = str(row.get("pregnancy_cues", ""))
         if "pregnant" in preg_raw:
             subgroups.append("pregnant")
@@ -177,9 +178,6 @@ def load_medqa_audit(
     return index
 
 
-# Regex fallback for items not in audit (e.g. different split or dataset).
-# Tuned for MedQA: avoids "man/woman" (routine), "blind" (study design),
-# "trans" (pharmacology), "black" (clinical findings).
 SUBGROUP_PATTERNS: dict[str, list[str]] = {
     "gay": [r"\bgay\b", r"\bhomosexual\b"],
     "lesbian": [r"\blesbian\b"],
@@ -230,28 +228,56 @@ def evaluate_items(
 ) -> list[dict[str, Any]]:
     """Run baseline + steered evaluation on all items.
 
-    Returns list of per-item result dicts.
+    Returns list of per-item result dicts with fields needed for
+    compute_all_metrics().
     """
     results = []
     for i, item in enumerate(items):
         prompt = item.get("prompt", "")
         correct = item.get("answer", "")
+        # Use per-item letters if available, otherwise fall back to caller's default
+        item_letters = tuple(item["letters"]) if "letters" in item else letters
 
-        baseline = steerer.evaluate_baseline_mcq(prompt, letters=letters)
-        steered = steerer.steer_and_evaluate(prompt, steering_vec, letters=letters)
+        baseline = steerer.evaluate_baseline_mcq(prompt, letters=item_letters)
+        steered = steerer.steer_and_evaluate(prompt, steering_vec, letters=item_letters)
 
-        b_correct = int(baseline["model_answer"] == correct)
-        s_correct = int(steered["model_answer"] == correct)
-        flipped = baseline["model_answer"] != steered["model_answer"]
+        b_ans = baseline["model_answer"]
+        s_ans = steered["model_answer"]
+        b_correct = int(b_ans == correct)
+        s_correct = int(s_ans == correct)
+        flipped = b_ans != s_ans
+
+        logits_b = {k: float(v) for k, v in baseline.get("answer_logits", {}).items()}
+        logits_s = {k: float(v) for k, v in steered.get("answer_logits", {}).items()}
+
+        margin = compute_margin(logits_b, b_ans) if b_ans in logits_b else 0.0
+
+        # Determine stereotyped option (if available in item)
+        stereo_opt = ""
+        answer_roles = item.get("answer_roles", {})
+        for letter, role in answer_roles.items():
+            if role == "stereotyped_target":
+                stereo_opt = letter
+                break
+
+        # Corrected: baseline was wrong (or stereotyped), steered is correct
+        corrected = (not b_correct and s_correct)
+        corrupted = (b_correct and not s_correct)
 
         results.append({
             "item_idx": item.get("item_idx", i),
             "correct": correct,
-            "baseline_answer": baseline["model_answer"],
-            "steered_answer": steered["model_answer"],
+            "baseline_answer": b_ans,
+            "steered_answer": s_ans,
             "baseline_correct": b_correct,
             "steered_correct": s_correct,
             "flipped": int(flipped),
+            "margin": margin,
+            "logit_baseline": logits_b,
+            "logit_steered": logits_s,
+            "stereotyped_option": stereo_opt,
+            "corrected": corrected,
+            "corrupted": corrupted,
             "subject": item.get("subject", ""),
             "demographic_subgroups": item.get("demographic_subgroups", []),
         })
@@ -263,20 +289,233 @@ def evaluate_items(
 
 
 def _summarise(results: list[dict]) -> dict[str, Any]:
-    """Compute accuracy metrics from per-item results."""
+    """Compute accuracy metrics + confidence-aware metrics from per-item results."""
     n = len(results)
     if n == 0:
         return {"n": 0}
     b = sum(r["baseline_correct"] for r in results)
     s = sum(r["steered_correct"] for r in results)
     f = sum(r["flipped"] for r in results)
-    return {
+
+    summary = {
         "n": n,
         "accuracy_baseline": round(b / n, 4),
         "accuracy_steered": round(s / n, 4),
         "delta": round((s - b) / n, 4),
         "flip_rate": round(f / n, 4),
     }
+
+    # Add confidence-aware metrics
+    metrics = compute_all_metrics(results)
+    summary["metrics"] = metrics
+
+    return summary
+
+
+# ---------------------------------------------------------------------------
+# Figures
+# ---------------------------------------------------------------------------
+
+
+def fig_medqa_matched_vs_mismatched(
+    all_medqa: dict[str, dict[str, Any]],
+    vectors: dict[str, Any],
+    output_dir: Path,
+) -> None:
+    """Per-category grouped bars: accuracy delta by condition."""
+    # Group by category
+    by_cat: dict[str, list[tuple[str, dict]]] = {}
+    for vec_key, entry in all_medqa.items():
+        cat = entry.get("category", "")
+        by_cat.setdefault(cat, []).append((entry.get("subgroup", vec_key), entry))
+
+    cats = sorted(by_cat.keys())
+    if not cats:
+        return
+
+    n = len(cats)
+    ncols = min(3, n)
+    nrows = (n + ncols - 1) // ncols
+
+    fig, axes = plt.subplots(nrows, ncols, figsize=(6 * ncols, 4 * nrows), squeeze=False)
+    conditions = ["matched", "within_cat_mismatched", "cross_cat_mismatched", "no_demographic"]
+    cond_labels = ["Matched", "Within-cat\nmismatch", "Cross-cat\nmismatch", "No demo"]
+    cond_colors = [BLUE, ORANGE, GREEN, GRAY]
+
+    for idx, cat in enumerate(cats):
+        row, col = divmod(idx, ncols)
+        ax = axes[row, col]
+
+        subs = sorted(by_cat[cat], key=lambda x: x[0])
+        sub_names = [s for s, _ in subs]
+        n_subs = len(sub_names)
+        n_conds = len(conditions)
+        width = 0.8 / n_conds
+        x = np.arange(n_subs)
+
+        for ci, (cond, clabel, ccolor) in enumerate(zip(conditions, cond_labels, cond_colors)):
+            vals = []
+            for _, entry in subs:
+                d = entry.get(cond, {}).get("delta", 0)
+                vals.append(d)
+            bars = ax.bar(x + ci * width - 0.4 + width / 2, vals, width,
+                          color=ccolor, label=clabel if idx == 0 else "", alpha=0.8)
+            for bar, v in zip(bars, vals):
+                if v != 0:
+                    ax.text(bar.get_x() + bar.get_width() / 2, v,
+                            f"{v:.2f}", ha="center", va="bottom" if v > 0 else "top",
+                            fontsize=5)
+
+        ax.axhline(y=0, color="black", linewidth=0.5)
+        ax.set_xticks(x)
+        ax.set_xticklabels(sub_names, fontsize=8, rotation=30, ha="right")
+        ax.set_ylabel("Accuracy delta", fontsize=8)
+        cat_label = CATEGORY_LABELS.get(cat, cat)
+        ax.set_title(cat_label, fontsize=9)
+
+    for idx in range(n, nrows * ncols):
+        row, col = divmod(idx, ncols)
+        axes[row, col].set_visible(False)
+
+    fig.legend(loc="upper center", ncol=4, fontsize=7, bbox_to_anchor=(0.5, 1.02))
+    fig.suptitle("MedQA accuracy delta by condition", fontsize=11, y=1.05)
+    _save_both(fig, output_dir / "fig_medqa_matched_vs_mismatched.png")
+    log("    Saved fig_medqa_matched_vs_mismatched")
+
+
+def fig_medqa_exacerbation(
+    all_medqa: dict[str, dict[str, Any]],
+    output_dir: Path,
+) -> None:
+    """Paired bars: debiasing vs exacerbation delta."""
+    entries = [(e.get("subgroup", k), e) for k, e in all_medqa.items()]
+    entries.sort()
+
+    labels = [s for s, _ in entries]
+    debias_vals = [e.get("matched", {}).get("delta", 0) for _, e in entries]
+    exac_vals = [e.get("exacerbation_matched", {}).get("delta", 0) for _, e in entries]
+
+    if not labels:
+        return
+
+    x = np.arange(len(labels))
+    width = 0.35
+
+    fig, ax = plt.subplots(figsize=(max(8, len(labels) * 1.5), 5))
+    ax.bar(x - width / 2, debias_vals, width, color=BLUE, label="Debiasing", alpha=0.8)
+    ax.bar(x + width / 2, exac_vals, width, color=VERMILLION, label="Exacerbation", alpha=0.8)
+
+    ax.axhline(y=0, color="black", linewidth=0.5)
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, rotation=30, ha="right", fontsize=8)
+    ax.set_ylabel("Accuracy delta")
+    ax.set_title("MedQA debiasing vs exacerbation")
+    ax.legend(fontsize=8)
+
+    _save_both(fig, output_dir / "fig_medqa_exacerbation.png")
+    log("    Saved fig_medqa_exacerbation")
+
+
+def fig_side_effect_heatmap(
+    all_medqa: dict[str, dict[str, Any]],
+    all_mmlu: dict[str, dict[str, Any]],
+    output_dir: Path,
+) -> None:
+    """Heatmap: steering vectors vs knowledge domain accuracy deltas."""
+    vec_keys = sorted(set(list(all_medqa.keys()) + list(all_mmlu.keys())))
+    if not vec_keys:
+        return
+
+    # Columns: MedQA no-demo, MMLU overall, MMLU STEM, MMLU humanities, MMLU social science
+    col_labels = ["MedQA\nno-demo", "MMLU\noverall", "MMLU\nSTEM", "MMLU\nHumanities", "MMLU\nSocial Sci"]
+    mat = np.full((len(vec_keys), len(col_labels)), np.nan)
+
+    for i, vk in enumerate(vec_keys):
+        medqa = all_medqa.get(vk, {})
+        mmlu = all_mmlu.get(vk, {})
+
+        mat[i, 0] = medqa.get("no_demographic", {}).get("delta", np.nan)
+        mat[i, 1] = mmlu.get("delta", np.nan)
+
+        per_subj = mmlu.get("per_subject", {})
+        stem_subjs = [s for s in per_subj if any(kw in s.lower() for kw in
+                      ["math", "physics", "chemistry", "biology", "computer", "engineering"])]
+        hum_subjs = [s for s in per_subj if any(kw in s.lower() for kw in
+                     ["history", "philosophy", "literature", "law"])]
+        soc_subjs = [s for s in per_subj if any(kw in s.lower() for kw in
+                     ["sociology", "psychology", "economics", "politics", "geography"])]
+
+        for col_idx, subjs in [(2, stem_subjs), (3, hum_subjs), (4, soc_subjs)]:
+            if subjs:
+                deltas = [per_subj[s].get("delta", 0) for s in subjs]
+                mat[i, col_idx] = float(np.mean(deltas))
+
+    vmax = max(abs(np.nanmin(mat)), abs(np.nanmax(mat)), 0.05)
+    fig, ax = plt.subplots(figsize=(max(7, len(col_labels) * 1.5),
+                                     max(5, len(vec_keys) * 0.4)))
+    im = ax.imshow(mat, cmap="RdBu_r", vmin=-vmax, vmax=vmax, aspect="auto")
+
+    ax.set_xticks(range(len(col_labels)))
+    ax.set_xticklabels(col_labels, fontsize=8)
+    ax.set_yticks(range(len(vec_keys)))
+    ax.set_yticklabels(vec_keys, fontsize=7)
+
+    for i in range(mat.shape[0]):
+        for j in range(mat.shape[1]):
+            if not np.isnan(mat[i, j]):
+                color = "white" if abs(mat[i, j]) > vmax * 0.6 else "black"
+                ax.text(j, i, f"{mat[i,j]:.3f}", ha="center", va="center",
+                        fontsize=6, color=color)
+
+    fig.colorbar(im, ax=ax, label="Accuracy delta", shrink=0.8)
+    ax.set_title("Side effects of steering on knowledge benchmarks")
+
+    _save_both(fig, output_dir / "fig_side_effect_heatmap.png")
+    log("    Saved fig_side_effect_heatmap")
+
+
+def fig_debiasing_vs_exacerbation_asymmetry(
+    all_medqa: dict[str, dict[str, Any]],
+    manifests: list[dict],
+    output_dir: Path,
+) -> None:
+    """Scatter: BBQ RCR_1.0 vs MedQA exacerbation accuracy drop."""
+    x_vals, y_vals, labels, cats = [], [], [], []
+
+    manifest_by_key: dict[str, dict] = {}
+    for m in manifests:
+        key = f"{m.get('category', '')}_{m.get('subgroup', '')}"
+        manifest_by_key[key] = m
+
+    for vec_key, entry in all_medqa.items():
+        m = manifest_by_key.get(vec_key, {})
+        rcr = m.get("metrics", {}).get("rcr_1.0", {}).get("rcr", 0)
+        exac_delta = entry.get("exacerbation_matched", {}).get("delta", None)
+        if exac_delta is None:
+            continue
+
+        x_vals.append(rcr)
+        y_vals.append(exac_delta)
+        labels.append(vec_key)
+        cats.append(entry.get("category", ""))
+
+    if not x_vals:
+        return
+
+    fig, ax = plt.subplots(figsize=(7, 5))
+    for i in range(len(x_vals)):
+        color = CATEGORY_COLORS.get(cats[i], GRAY)
+        ax.scatter(x_vals[i], y_vals[i], c=color, s=40, alpha=0.8)
+        ax.annotate(labels[i].split("_", 1)[-1], (x_vals[i], y_vals[i]),
+                    fontsize=6, xytext=(3, 3), textcoords="offset points")
+
+    ax.set_xlabel("BBQ RCR_1.0 (debiasing benefit)", fontsize=9)
+    ax.set_ylabel("MedQA accuracy delta under exacerbation", fontsize=9)
+    ax.set_title("Debiasing benefit vs exacerbation vulnerability")
+    ax.axhline(y=0, color="gray", linestyle=":", alpha=0.5)
+
+    _save_both(fig, output_dir / "fig_debiasing_vs_exacerbation_asymmetry.png")
+    log("    Saved fig_debiasing_vs_exacerbation_asymmetry")
 
 
 # ---------------------------------------------------------------------------
@@ -303,8 +542,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max_items", type=int, default=None)
     p.add_argument("--output_dir", default=None)
     p.add_argument("--skip_figures", action="store_true")
-    p.add_argument("--exacerbation", action="store_true",
-                   help="Also test with flipped alpha (bias amplification)")
 
     return p.parse_args()
 
@@ -335,10 +572,10 @@ def main() -> None:
     log(f"Loaded {len(manifests)} steering manifests")
 
     # Load steering vectors
-    vectors: dict[str, dict[str, Any]] = {}  # "cat_sub" → {vector, layer, alpha}
+    vectors: dict[str, dict[str, Any]] = {}
     for npz_path in sorted(vec_dir.glob("*.npz")):
         data = np.load(npz_path, allow_pickle=True)
-        key = npz_path.stem  # e.g. "so_gay"
+        key = npz_path.stem
         vectors[key] = {
             "vector": torch.from_numpy(data["vector"]),
             "injection_layer": int(data["injection_layer"]),
@@ -383,18 +620,15 @@ def main() -> None:
         mmlu_items = load_mmlu_items(args.mmlu_path, max_items=args.max_items)
         log(f"Loaded {len(mmlu_items)} MMLU items")
 
-    # Classify MedQA items by demographic content.
-    # Prefer the pre-validated audit CSV; fall back to regex for items not covered.
+    # Classify MedQA items by demographic content
     all_subgroups = list(SUBGROUP_PATTERNS.keys())
-    audit_index = load_medqa_audit()  # returns {} if file not found
+    audit_index = load_medqa_audit()
     n_from_audit = 0
     n_from_regex = 0
 
     if medqa_items:
         for i, item in enumerate(medqa_items):
-            # Match to audit by question text prefix (first 100 chars, lowered)
             text = item.get("prompt", "") or item.get("question", "")
-            # The prompt starts with "Question: ...", extract the question part
             q_text = text
             if q_text.startswith("Question:"):
                 q_text = q_text[len("Question:"):].strip()
@@ -415,6 +649,7 @@ def main() -> None:
     # ---- Run evaluations per steering vector ----
     all_medqa: dict[str, dict[str, Any]] = {}
     all_mmlu: dict[str, dict[str, Any]] = {}
+    all_per_item: list[dict] = []  # 7D: per-item records
 
     for vec_key, vec_data in sorted(vectors.items()):
         parts = vec_key.split("_", 1)
@@ -436,40 +671,91 @@ def main() -> None:
             # Matched: items mentioning this subgroup
             matched = [it for it in medqa_items if sub in it.get("demographic_subgroups", [])]
 
-            # Mismatched: items mentioning a different subgroup from same category
-            # Find all subgroups for this category from vectors
+            # 7B: Within-category mismatched
             cat_subs = [k.split("_", 1)[1] for k in vectors if k.startswith(cat + "_")]
-            mismatched = [
+            within_mismatched = [
                 it for it in medqa_items
                 if any(s in it.get("demographic_subgroups", []) for s in cat_subs if s != sub)
                 and sub not in it.get("demographic_subgroups", [])
             ]
 
+            # 7B: Cross-category mismatched
+            other_cat_subs = [k.split("_", 1)[1] for k in vectors if not k.startswith(cat + "_")]
+            cross_mismatched = [
+                it for it in medqa_items
+                if any(s in it.get("demographic_subgroups", []) for s in other_cat_subs)
+                and not any(s in it.get("demographic_subgroups", []) for s in cat_subs)
+            ]
+
             # No-demographic
             no_demo = [it for it in medqa_items if not it.get("mentions_demographic")]
+            # 7C: Use --max_items instead of hardcoded [:200]
+            if args.max_items:
+                no_demo = no_demo[:args.max_items]
 
-            entry: dict[str, Any] = {"vector": vec_key, "category": cat, "subgroup": sub}
+            entry: dict[str, Any] = {
+                "vector": vec_key, "category": cat, "subgroup": sub,
+            }
 
             if matched:
                 log(f"    MedQA matched ({sub}): {len(matched)} items")
                 res = evaluate_items(steerer, matched, vec, letters=("A", "B", "C", "D", "E"))
                 entry["matched"] = _summarise(res)
-            if mismatched:
-                log(f"    MedQA mismatched: {len(mismatched)} items")
-                res = evaluate_items(steerer, mismatched, vec, letters=("A", "B", "C", "D", "E"))
-                entry["mismatched"] = _summarise(res)
+                for r in res:
+                    r["condition"] = "matched"
+                    r["steering_vector_key"] = vec_key
+                    r["category"] = cat
+                    r["subgroup"] = sub
+                all_per_item.extend(res)
+
+            if within_mismatched:
+                log(f"    MedQA within-cat mismatched: {len(within_mismatched)} items")
+                res = evaluate_items(steerer, within_mismatched, vec, letters=("A", "B", "C", "D", "E"))
+                entry["within_cat_mismatched"] = _summarise(res)
+                for r in res:
+                    r["condition"] = "within_cat_mismatched"
+                    r["steering_vector_key"] = vec_key
+                    r["category"] = cat
+                    r["subgroup"] = sub
+                all_per_item.extend(res)
+
+            if cross_mismatched:
+                log(f"    MedQA cross-cat mismatched: {len(cross_mismatched)} items")
+                res = evaluate_items(steerer, cross_mismatched, vec, letters=("A", "B", "C", "D", "E"))
+                entry["cross_cat_mismatched"] = _summarise(res)
+                for r in res:
+                    r["condition"] = "cross_cat_mismatched"
+                    r["steering_vector_key"] = vec_key
+                    r["category"] = cat
+                    r["subgroup"] = sub
+                all_per_item.extend(res)
+
             if no_demo:
-                log(f"    MedQA no-demo: {len(no_demo[:200])} items")
-                res = evaluate_items(steerer, no_demo[:200], vec, letters=("A", "B", "C", "D", "E"))
+                log(f"    MedQA no-demo: {len(no_demo)} items")
+                res = evaluate_items(steerer, no_demo, vec, letters=("A", "B", "C", "D", "E"))
                 entry["no_demographic"] = _summarise(res)
 
-            # Exacerbation: flip alpha sign
-            if args.exacerbation:
-                neg_vec = -vec
-                if matched:
-                    log(f"    MedQA exacerbation (matched): {len(matched)} items")
-                    res_ex = evaluate_items(steerer, matched, neg_vec, letters=("A", "B", "C", "D", "E"))
-                    entry["exacerbation_matched"] = _summarise(res_ex)
+            # 7A: Exacerbation always runs (both directions)
+            neg_vec = -vec
+            if matched:
+                log(f"    MedQA exacerbation (matched): {len(matched)} items")
+                res_ex = evaluate_items(steerer, matched, neg_vec, letters=("A", "B", "C", "D", "E"))
+                entry["exacerbation_matched"] = _summarise(res_ex)
+
+            if within_mismatched:
+                log(f"    MedQA exacerbation (within-cat mismatch): {len(within_mismatched)} items")
+                res_ex = evaluate_items(steerer, within_mismatched, neg_vec, letters=("A", "B", "C", "D", "E"))
+                entry["exacerbation_within_cat_mismatched"] = _summarise(res_ex)
+
+            if cross_mismatched:
+                log(f"    MedQA exacerbation (cross-cat mismatch): {len(cross_mismatched)} items")
+                res_ex = evaluate_items(steerer, cross_mismatched, neg_vec, letters=("A", "B", "C", "D", "E"))
+                entry["exacerbation_cross_cat_mismatched"] = _summarise(res_ex)
+
+            if no_demo:
+                log(f"    MedQA exacerbation (no-demo): {len(no_demo)} items")
+                res_ex = evaluate_items(steerer, no_demo, neg_vec, letters=("A", "B", "C", "D", "E"))
+                entry["exacerbation_no_demographic"] = _summarise(res_ex)
 
             all_medqa[vec_key] = entry
             atomic_save_json(entry, medqa_out / f"{vec_key}.json")
@@ -477,8 +763,13 @@ def main() -> None:
         # ---- MMLU ----
         if mmlu_items:
             mmlu_out = ensure_dir(output_dir / "mmlu")
-            log(f"    MMLU: {len(mmlu_items[:200])} items")
-            res = evaluate_items(steerer, mmlu_items[:200], vec)
+            # 7C: Use --max_items instead of hardcoded [:200]
+            items_to_eval = mmlu_items
+            if args.max_items:
+                items_to_eval = mmlu_items[:args.max_items]
+
+            log(f"    MMLU: {len(items_to_eval)} items")
+            res = evaluate_items(steerer, items_to_eval, vec)
             mmlu_entry = _summarise(res)
             mmlu_entry["vector"] = vec_key
 
@@ -502,6 +793,17 @@ def main() -> None:
                 for s, d in per_subj.items()
             }
 
+            # Find worst subject
+            if per_subj:
+                worst = min(per_subj.items(), key=lambda x: (x[1]["s"] - x[1]["b"]) / max(x[1]["n"], 1))
+                mmlu_entry["worst_subject"] = worst[0]
+                mmlu_entry["worst_subject_delta"] = (worst[1]["s"] - worst[1]["b"]) / max(worst[1]["n"], 1)
+
+            # 7A: MMLU exacerbation
+            log(f"    MMLU exacerbation: {len(items_to_eval)} items")
+            res_ex = evaluate_items(steerer, items_to_eval, -vec)
+            mmlu_entry["exacerbation"] = _summarise(res_ex)
+
             all_mmlu[vec_key] = mmlu_entry
             atomic_save_json(mmlu_entry, mmlu_out / f"{vec_key}.json")
 
@@ -515,18 +817,46 @@ def main() -> None:
     if all_mmlu:
         atomic_save_json(all_mmlu, output_dir / "mmlu_steering_results.json")
 
-    # Update manifests with generalization results
+    # 7D: Save per-item parquet
+    if all_per_item and pd is not None:
+        per_item_dir = ensure_dir(output_dir / "per_item")
+        for r in all_per_item:
+            r["logit_baseline"] = json.dumps(r.get("logit_baseline", {}))
+            r["logit_steered"] = json.dumps(r.get("logit_steered", {}))
+            r["demographic_subgroups"] = json.dumps(r.get("demographic_subgroups", []))
+        df = pd.DataFrame(all_per_item)
+        df.to_parquet(per_item_dir / "medqa_per_item.parquet", index=False)
+        log(f"Saved {len(all_per_item)} per-item MedQA records")
+
+    # 7F: Update manifests with generalization results
     for m in manifests:
         key = f"{m['category']}_{m['subgroup']}"
         if key in all_medqa:
             md = all_medqa[key]
-            m["medqa_matched_accuracy_delta"] = md.get("matched", {}).get("delta")
-            m["medqa_mismatched_accuracy_delta"] = md.get("mismatched", {}).get("delta")
-            m["medqa_nodemo_accuracy_delta"] = md.get("no_demographic", {}).get("delta")
+            m["medqa_matched_delta"] = md.get("matched", {}).get("delta")
+            m["medqa_within_cat_mismatched_delta"] = md.get("within_cat_mismatched", {}).get("delta")
+            m["medqa_cross_cat_mismatched_delta"] = md.get("cross_cat_mismatched", {}).get("delta")
+            m["medqa_nodemo_delta"] = md.get("no_demographic", {}).get("delta")
+            m["medqa_exacerbation_matched_delta"] = md.get("exacerbation_matched", {}).get("delta")
         if key in all_mmlu:
-            m["mmlu_accuracy_delta"] = all_mmlu[key].get("delta")
+            m["mmlu_delta"] = all_mmlu[key].get("delta")
+            m["mmlu_worst_subject"] = all_mmlu[key].get("worst_subject")
+            m["mmlu_worst_subject_delta"] = all_mmlu[key].get("worst_subject_delta")
 
     atomic_save_json(manifests, output_dir / "steering_manifests_with_gen.json")
+
+    # 7G: Figures
+    if not args.skip_figures:
+        fig_out = ensure_dir(output_dir / "figures")
+        log("\nGenerating figures ...")
+
+        if all_medqa:
+            fig_medqa_matched_vs_mismatched(all_medqa, vectors, fig_out)
+            fig_medqa_exacerbation(all_medqa, fig_out)
+            fig_debiasing_vs_exacerbation_asymmetry(all_medqa, manifests, fig_out)
+
+        if all_medqa or all_mmlu:
+            fig_side_effect_heatmap(all_medqa, all_mmlu, fig_out)
 
     total = time.time() - t0
     log(f"\nComplete in {total:.1f}s")

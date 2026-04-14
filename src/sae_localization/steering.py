@@ -167,6 +167,15 @@ class SAESteerer:
             Base coefficient (negative to dampen, positive to amplify).
         scale_by_sqrt_n : bool
             If True, multiply alpha by 1/sqrt(N) to normalise perturbation magnitude.
+
+        .. note:: Magnitude convention — this function applies alpha/sqrt(n) per
+           feature then sums, so total perturbation magnitude scales as
+           ~alpha * sqrt(k) for k features.  This differs from
+           ``build_subgroup_steering_vector()`` in ``subgroup_steering.py``,
+           which takes the mean of unit directions then multiplies by alpha
+           (magnitude ~alpha/sqrt(k)).  Same alpha value produces different
+           perturbation magnitudes by factor of k.  Do NOT compare alpha values
+           across these two conventions.
         """
         n = len(feature_indices)
         if n == 0:

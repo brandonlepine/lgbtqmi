@@ -50,6 +50,17 @@ SUBGROUP_ALPHA="${SUBGROUP_ALPHA:-14.0}"
 CROWS_PAIRS_PATH="${CROWS_PAIRS_PATH:-data/raw/crows_pairs.csv}"
 CROWS_MAX_ITEMS="${CROWS_MAX_ITEMS:-${MAX_ITEMS}}"
 
+# Optional: run SAE-based pipeline (localization + analysis + steering + interpretability).
+RUN_SAE="${RUN_SAE:-0}"
+SAE_SOURCE="${SAE_SOURCE:-fnlp/Llama3_1-8B-Base-LXR-8x}"
+SAE_EXPANSION="${SAE_EXPANSION:-8}"
+SAE_LAYERS="${SAE_LAYERS:-}"  # auto-detect if empty
+SAE_CATEGORIES="${SAE_CATEGORIES:-so,disability}"
+SAE_ALPHA_VALUES="${SAE_ALPHA_VALUES:--80,-60,-40,-20,-10,-5,5,10,20,40,60,80}"
+SAE_K_STEPS="${SAE_K_STEPS:-1,2,3,5,8,13,21}"
+MEDQA_PATH="${MEDQA_PATH:-datasets/medqa/}"
+MMLU_PATH="${MMLU_PATH:-datasets/mmlu/}"
+
 MAX_ITEMS_ARGS=()
 if [[ -n "${MAX_ITEMS}" ]]; then
   MAX_ITEMS_ARGS=(--max_items "${MAX_ITEMS}")
@@ -90,6 +101,9 @@ echo "SUBGROUP_MAX_ITEMS: ${SUBGROUP_MAX_ITEMS:-<none>}"
 echo "SUBGROUP_ALPHA: ${SUBGROUP_ALPHA}"
 echo "CROWS_PAIRS_PATH: ${CROWS_PAIRS_PATH}"
 echo "CROWS_MAX_ITEMS:  ${CROWS_MAX_ITEMS:-<none>}"
+echo "RUN_SAE:          ${RUN_SAE}"
+echo "SAE_SOURCE:       ${SAE_SOURCE}"
+echo "SAE_CATEGORIES:   ${SAE_CATEGORIES}"
 echo
 
 if [[ ! -d "${MODEL_PATH}" ]]; then
@@ -288,6 +302,150 @@ if [[ "${RUN_SUBGROUP}" == "1" ]]; then
 
   python scripts/analyze_subgroup_results.py \
     --run_dir "${RUN_DIR}"
+fi
+
+if [[ "${RUN_SAE}" == "1" ]]; then
+  echo
+  echo "============================================================"
+  echo "SAE PIPELINE (Stages 2-3 + Interpretability)"
+  echo "============================================================"
+
+  # Directories for SAE pipeline outputs
+  SAE_LOCALIZATION_DIR="results/sae_localization/${MODEL_ID}/${RUN_DATE}"
+  SAE_ANALYSIS_DIR="results/sae_analysis/${MODEL_ID}/${RUN_DATE}"
+  SAE_STEERING_FEATURES_DIR="results/steering_features/${MODEL_ID}"
+
+  SAE_MAX_ITEMS_ARGS=()
+  if [[ -n "${MAX_ITEMS}" ]]; then
+    SAE_MAX_ITEMS_ARGS=(--max_items "${MAX_ITEMS}")
+  fi
+
+  SAE_LAYERS_ARGS=()
+  if [[ -n "${SAE_LAYERS}" ]]; then
+    SAE_LAYERS_ARGS=(--layers "${SAE_LAYERS}")
+  fi
+
+  echo
+  echo "----- SAE Stage 1) Extract hidden states for SAE analysis -----"
+  python scripts/run_sae_localization.py \
+    --model_path "${MODEL_PATH}" \
+    --model_id "${MODEL_ID}" \
+    --device "${DEVICE}" \
+    --categories "${SAE_CATEGORIES}" \
+    "${SAE_MAX_ITEMS_ARGS[@]}"
+
+  echo
+  echo "----- SAE Stage 2) SAE feature analysis -----"
+  # Find the most recent localization dir
+  SAE_LOC_DIR=$(ls -td results/sae_localization/${MODEL_ID}/*/ 2>/dev/null | head -1)
+  if [[ -z "${SAE_LOC_DIR}" ]]; then
+    echo "WARNING: no SAE localization dir found, skipping SAE stages 2+"
+  else
+    python scripts/run_sae_analysis.py \
+      --model_path "${MODEL_PATH}" \
+      --model_id "${MODEL_ID}" \
+      --device "${DEVICE}" \
+      --sae_source "${SAE_SOURCE}" \
+      --sae_expansion "${SAE_EXPANSION}" \
+      --localization_dir "${SAE_LOC_DIR}" \
+      "${SAE_LAYERS_ARGS[@]}" \
+      "${SAE_MAX_ITEMS_ARGS[@]}"
+
+    # Find analysis dir
+    SAE_ANALYSIS_FOUND=$(ls -td results/sae_analysis/${MODEL_ID}/*/ 2>/dev/null | head -1)
+
+    echo
+    echo "----- SAE Stage 2b) Rank subgroup features -----"
+    if [[ -n "${SAE_ANALYSIS_FOUND}" ]]; then
+      python scripts/rank_subgroup_features.py \
+        --analysis_dir "${SAE_ANALYSIS_FOUND}" \
+        --model_id "${MODEL_ID}" \
+        "${SAE_LAYERS_ARGS[@]}"
+    fi
+
+    echo
+    echo "----- SAE Stage 3) Subgroup-specific steering optimization -----"
+    RANKED_PATH="${SAE_STEERING_FEATURES_DIR}/ranked_features_by_subgroup.json"
+    if [[ -f "${RANKED_PATH}" ]]; then
+      python scripts/run_subgroup_steering.py \
+        --model_path "${MODEL_PATH}" \
+        --model_id "${MODEL_ID}" \
+        --device "${DEVICE}" \
+        --sae_source "${SAE_SOURCE}" \
+        --sae_expansion "${SAE_EXPANSION}" \
+        --ranked_features "${RANKED_PATH}" \
+        --localization_dir "${SAE_LOC_DIR}" \
+        --categories "${SAE_CATEGORIES}" \
+        --alpha_values "${SAE_ALPHA_VALUES}" \
+        --k_steps "${SAE_K_STEPS}" \
+        "${SAE_MAX_ITEMS_ARGS[@]}"
+
+      # Find steering dir
+      SAE_STEERING_DIR=$(ls -td results/subgroup_steering/${MODEL_ID}/*/ 2>/dev/null | head -1)
+
+      echo
+      echo "----- SAE Stage 4) Feature interpretability -----"
+      if [[ -n "${SAE_STEERING_DIR}" ]]; then
+        python scripts/analyze_top_features.py \
+          --model_path "${MODEL_PATH}" \
+          --model_id "${MODEL_ID}" \
+          --device "${DEVICE}" \
+          --sae_source "${SAE_SOURCE}" \
+          --sae_expansion "${SAE_EXPANSION}" \
+          --steering_dir "${SAE_STEERING_DIR}" \
+          --localization_dir "${SAE_LOC_DIR}" \
+          --ranked_features "${RANKED_PATH}" \
+          --categories "${SAE_CATEGORIES}" \
+          "${SAE_MAX_ITEMS_ARGS[@]}"
+
+        echo
+        echo "----- SAE Stage 5) Universal backfire prediction -----"
+        python scripts/analyze_universal_backfire.py \
+          --model_path "${MODEL_PATH}" \
+          --model_id "${MODEL_ID}" \
+          --device "${DEVICE}" \
+          --sae_source "${SAE_SOURCE}" \
+          --sae_expansion "${SAE_EXPANSION}" \
+          --steering_dir "${SAE_STEERING_DIR}" \
+          --ranked_features "${RANKED_PATH}" \
+          --localization_dir "${SAE_LOC_DIR}" \
+          --categories "${SAE_CATEGORIES}" \
+          "${SAE_MAX_ITEMS_ARGS[@]}"
+
+        echo
+        echo "----- SAE Stage 6) Probe selectivity controls -----"
+        python scripts/run_probe_controls.py \
+          --localization_dir "${SAE_LOC_DIR}" \
+          --categories "${SAE_CATEGORIES}"
+
+        echo
+        echo "----- SAE Stage 7) Generalization evaluation (MedQA + MMLU) -----"
+        GEN_ARGS=()
+        if [[ -d "${MEDQA_PATH}" ]]; then
+          GEN_ARGS+=(--medqa_path "${MEDQA_PATH}")
+        fi
+        if [[ -d "${MMLU_PATH}" ]]; then
+          GEN_ARGS+=(--mmlu_path "${MMLU_PATH}")
+        fi
+        if [[ ${#GEN_ARGS[@]} -gt 0 ]]; then
+          python scripts/evaluate_generalization.py \
+            --model_path "${MODEL_PATH}" \
+            --model_id "${MODEL_ID}" \
+            --device "${DEVICE}" \
+            --sae_source "${SAE_SOURCE}" \
+            --sae_expansion "${SAE_EXPANSION}" \
+            --steering_dir "${SAE_STEERING_DIR}" \
+            --categories "${SAE_CATEGORIES}" \
+            "${GEN_ARGS[@]}" \
+            "${SAE_MAX_ITEMS_ARGS[@]}"
+        else
+          echo "  Skipping: neither MEDQA_PATH nor MMLU_PATH found"
+        fi
+      fi
+    else
+      echo "WARNING: ranked features not found at ${RANKED_PATH}, skipping stages 3+"
+    fi
+  fi
 fi
 
 echo

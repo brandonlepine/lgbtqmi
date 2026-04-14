@@ -79,6 +79,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--mmlu_path", default=None)
     p.add_argument("--medqa_path", default=None)
     p.add_argument(
+        "--medqa_demo_mode",
+        default="broad",
+        choices=["narrow", "broad"],
+        help="How to tag MedQA items with demographic subgroup labels. "
+        "'narrow' tags explicit identity categories (small n); "
+        "'broad' also tags age + binary sex terms (large n).",
+    )
+    p.add_argument(
         "--e_alpha_agg",
         default="median",
         choices=["mean", "median"],
@@ -90,6 +98,31 @@ def parse_args() -> argparse.Namespace:
         default=50,
         help="For Experiment E, take at most top-K pro-bias features per category (by |cohens_d|). "
         "Reduces 'smearing' many weak features across unrelated contexts. Set <=0 to disable.",
+    )
+    p.add_argument(
+        "--e_mmlu_per_category",
+        action="store_true",
+        help="Compute category-specific MMLU side-effect deltas by steering with each category's "
+        "own pro-bias feature set + its optimal alpha. This is much slower than the global E vector.",
+    )
+    p.add_argument(
+        "--skip_e_medqa_subgroup_conditional",
+        action="store_true",
+        help="Skip MedQA subgroup-conditioned steering controls (E2b). "
+        "By default, E2b runs whenever --medqa_path is provided and per-subcategory features exist.",
+    )
+    p.add_argument(
+        "--e_subgroup_top_k",
+        type=int,
+        default=25,
+        help="For subgroup-conditioned MedQA steering, take top-K pro-bias features per (category, subcategory) "
+        "by |cohens_d|. Set <=0 to disable filtering.",
+    )
+    p.add_argument(
+        "--e_control_non_demo_n",
+        type=int,
+        default=200,
+        help="Number of non-demographic MedQA items to sample for random-vector control in subgroup-conditioned E.",
     )
 
     p.add_argument("--skip_figures", action="store_true")
@@ -485,7 +518,11 @@ def main() -> None:
                 log("  Loading MedQA items ...")
                 try:
                     from src.data.medqa_loader import load_medqa_items
-                    medqa_items = load_medqa_items(args.medqa_path, max_items=args.max_items)
+                    medqa_items = load_medqa_items(
+                        args.medqa_path,
+                        max_items=args.max_items,
+                        demographic_mode=args.medqa_demo_mode,
+                    )
                     log(f"  Loaded {len(medqa_items)} MedQA items")
                     if not medqa_items:
                         raise SystemExit(
@@ -511,6 +548,228 @@ def main() -> None:
                     "scale_by_sqrt_n": True,
                     "layer": int(args.sae_layer),
                 }
+
+                # Optional: MedQA subgroup-conditioned steering + controls
+                if (not args.skip_e_medqa_subgroup_conditional) and medqa_items is not None and not per_sub_df.empty:
+                    log("  Experiment E2b (MedQA subgroup-conditional): computing matched/mismatched controls ...")
+                    import numpy as np
+                    import pandas as pd
+
+                    # Build (category, subcategory) -> feature list
+                    sub_df = per_sub_df[
+                        (per_sub_df["direction"] == "pro_bias")
+                        & (per_sub_df["is_significant"] == True)  # noqa: E712
+                        & (per_sub_df["category"].isin(valid_cats))
+                    ].copy()
+                    feats_by_sub: dict[tuple[str, str], list[int]] = {}
+                    if not sub_df.empty:
+                        sub_df["abs_d"] = sub_df["cohens_d"].abs()
+                        for (cat, sub), g in sub_df.groupby(["category", "subcategory"]):
+                            gg = g.sort_values("abs_d", ascending=False)
+                            if args.e_subgroup_top_k and args.e_subgroup_top_k > 0:
+                                gg = gg.head(int(args.e_subgroup_top_k))
+                            feats = gg["feature_idx"].astype(int).tolist()
+                            if feats:
+                                feats_by_sub[(str(cat), str(sub))] = feats
+
+                    # Helper: pick first usable tag in an item
+                    def _pick_tag(item: dict) -> tuple[str, str] | None:
+                        tags = item.get("demographic_tags") or []
+                        for tag in tags:
+                            # Find any (cat, sub) with exact subcategory match
+                            for (cat, sub) in feats_by_sub.keys():
+                                if sub == tag:
+                                    return (cat, sub)
+                        return None
+
+                    tagged = []
+                    untagged = []
+                    for it in medqa_items:
+                        if _pick_tag(it) is None:
+                            untagged.append(it)
+                        else:
+                            tagged.append(it)
+
+                    rng = np.random.default_rng(42)
+                    if args.e_control_non_demo_n and args.e_control_non_demo_n > 0 and len(untagged) > 0:
+                        untagged = list(rng.choice(untagged, size=min(len(untagged), int(args.e_control_non_demo_n)), replace=False))
+                    else:
+                        untagged = []
+
+                    all_keys = list(feats_by_sub.keys())
+                    if not all_keys:
+                        log("    WARNING: no significant per-subcategory pro-bias features found; skipping E2b")
+                    else:
+                        # Bug 0C fix: pre-compute baselines once to avoid redundant forward passes
+                        baseline_cache: dict[int, dict] = {}
+                        for it in tagged + untagged:
+                            idx = it.get("item_idx", id(it))
+                            if idx not in baseline_cache:
+                                prompt = it.get("prompt", "")
+                                letters = tuple(it.get("letters") or ("A", "B", "C", "D"))
+                                baseline_cache[idx] = steerer.evaluate_baseline_mcq(prompt, letters=letters)
+
+                        rows = []
+                        # Bug 0D fix: split mismatched into within-category and cross-category
+                        conditions = [
+                            "matched_suppress", "matched_amplify",
+                            "mismatched_within_suppress", "mismatched_within_amplify",
+                            "mismatched_cross_suppress", "mismatched_cross_amplify",
+                            "random_on_untagged_suppress", "random_on_untagged_amplify",
+                        ]
+                        for condition in conditions:
+                            items = tagged if "untagged" not in condition else untagged
+                            if not items:
+                                continue
+                            n_correct_b = 0
+                            n_correct_s = 0
+                            n_flip = 0
+                            n_evaluated = 0  # Bug 0B fix: count only non-skipped items
+                            for i, it in enumerate(items):
+                                prompt = it.get("prompt", "")
+                                correct = it.get("answer", "")
+                                letters = tuple(it.get("letters") or ("A", "B", "C", "D"))
+                                baseline = baseline_cache[it.get("item_idx", id(it))]
+
+                                key = _pick_tag(it)
+                                if "mismatched_within" in condition:
+                                    if key is None:
+                                        continue
+                                    cat, sub = key
+                                    # Pick a different subgroup from the SAME category
+                                    same_cat_others = [k for k in all_keys if k[0] == cat and k != (cat, sub)]
+                                    if not same_cat_others:
+                                        continue
+                                    cat, sub = same_cat_others[int(rng.integers(0, len(same_cat_others)))]
+                                elif "mismatched_cross" in condition:
+                                    if key is None:
+                                        continue
+                                    cat, sub = key
+                                    # Pick a subgroup from a DIFFERENT category
+                                    diff_cat_others = [k for k in all_keys if k[0] != cat]
+                                    if not diff_cat_others:
+                                        continue
+                                    cat, sub = diff_cat_others[int(rng.integers(0, len(diff_cat_others)))]
+                                elif "matched" in condition:
+                                    if key is None:
+                                        continue
+                                    cat, sub = key
+                                else:
+                                    # random on untagged: sample any subgroup key
+                                    cat, sub = all_keys[int(rng.integers(0, len(all_keys)))]
+
+                                feats = feats_by_sub.get((cat, sub), [])
+                                if not feats:
+                                    continue
+                                alpha_cat = float(optimal_alphas.get(cat, -10.0))
+                                alpha = alpha_cat if "suppress" in condition else abs(alpha_cat)
+                                vec = steerer.get_composite_steering(feats, alpha)
+                                steered = steerer.steer_and_evaluate(prompt, vec, letters=letters)
+
+                                ba = baseline.get("model_answer", "")
+                                sa = steered.get("model_answer", "")
+                                n_evaluated += 1
+                                n_correct_b += int(ba == correct)
+                                n_correct_s += int(sa == correct)
+                                n_flip += int(ba != sa)
+
+                            n = max(n_evaluated, 1)  # Bug 0B fix: use evaluated count, avoid div by zero
+                            rows.append({
+                                "condition": condition,
+                                "n_items": n_evaluated,
+                                "accuracy_original": n_correct_b / n,
+                                "accuracy_steered": n_correct_s / n,
+                                "delta": (n_correct_s - n_correct_b) / n,
+                                "flip_rate": n_flip / n,
+                                "n_tagged": len(tagged),
+                                "n_untagged_sampled": len(untagged),
+                                "demo_mode": args.medqa_demo_mode,
+                            })
+
+                        if rows:
+                            df = pd.DataFrame(rows)
+                            out_dir = ensure_dir(output_dir / "experiments")
+                            df.to_parquet(out_dir / "experiment_E_medqa_subgroup_conditional.parquet", index=False)
+                            exp_e["medqa_subgroup_conditional"] = rows
+
+                # Optional: per-category MMLU deltas (baseline computed once, then one steered pass per category)
+                if args.e_mmlu_per_category and mmlu_items:
+                    log("  Experiment E1b (MMLU per-category): computing category-specific deltas ...")
+                    baseline_ans: list[str] = []
+                    baseline_correct: list[int] = []
+                    corrects: list[str] = []
+                    subjects: list[str] = []
+                    for it in mmlu_items:
+                        prompt = (
+                            f"Subject: {it.get('subject','other')}\n"
+                            f"Question: {it.get('question','')}\n"
+                            f"A. {it.get('A','')}\n"
+                            f"B. {it.get('B','')}\n"
+                            f"C. {it.get('C','')}\n"
+                            f"D. {it.get('D','')}\n"
+                            "Answer:"
+                        )
+                        b = steerer.evaluate_baseline_mcq(prompt, letters=("A", "B", "C", "D"))
+                        a = b.get("model_answer", "")
+                        baseline_ans.append(a)
+                        c = it.get("answer", "")
+                        corrects.append(c)
+                        baseline_correct.append(int(a == c))
+                        subjects.append(it.get("subject", "other"))
+
+                    per_cat_mmlu: dict[str, Any] = {}
+                    for cat in valid_cats:
+                        feats = get_feature_set(per_cat_df, cat, direction="pro_bias")
+                        alpha_c = float(optimal_alphas.get(cat, -10.0))
+                        if not feats:
+                            continue
+                        vec_c = steerer.get_composite_steering(feats, alpha_c)
+                        n_flip = 0
+                        n_correct = 0
+                        per_subject: dict[str, dict[str, int]] = {}
+                        for i, it in enumerate(mmlu_items):
+                            prompt = (
+                                f"Subject: {it.get('subject','other')}\n"
+                                f"Question: {it.get('question','')}\n"
+                                f"A. {it.get('A','')}\n"
+                                f"B. {it.get('B','')}\n"
+                                f"C. {it.get('C','')}\n"
+                                f"D. {it.get('D','')}\n"
+                                "Answer:"
+                            )
+                            s = steerer.steer_and_evaluate(prompt, vec_c, letters=("A", "B", "C", "D"))
+                            sa = s.get("model_answer", "")
+                            if sa != baseline_ans[i]:
+                                n_flip += 1
+                            n_correct += int(sa == corrects[i])
+                            subj = subjects[i] or "other"
+                            per_subject.setdefault(subj, {"orig": 0, "steered": 0, "total": 0})
+                            per_subject[subj]["orig"] += baseline_correct[i]
+                            per_subject[subj]["steered"] += int(sa == corrects[i])
+                            per_subject[subj]["total"] += 1
+
+                        n = len(mmlu_items)
+                        per_cat_mmlu[cat] = {
+                            "n_items": n,
+                            "alpha": alpha_c,
+                            "n_features": int(len(feats)),
+                            "accuracy_original": sum(baseline_correct) / max(n, 1),
+                            "accuracy_steered": n_correct / max(n, 1),
+                            "delta": (n_correct - sum(baseline_correct)) / max(n, 1),
+                            "flip_rate": n_flip / max(n, 1),
+                            "per_subject": {
+                                s: {
+                                    "accuracy_original": d["orig"] / max(d["total"], 1),
+                                    "accuracy_steered": d["steered"] / max(d["total"], 1),
+                                    "delta": (d["steered"] - d["orig"]) / max(d["total"], 1),
+                                    "n_items": d["total"],
+                                }
+                                for s, d in per_subject.items()
+                            },
+                        }
+                        log(f"    {cat}: Δ={per_cat_mmlu[cat]['delta']:+.3f} flip={per_cat_mmlu[cat]['flip_rate']:.3f} alpha={alpha_c:.1f} n_feat={len(feats)}")
+
+                    exp_e["mmlu_by_category"] = per_cat_mmlu
 
     # ---- Cross-subgroup transfer (for Figure 28) ----
     for cat in valid_cats:
