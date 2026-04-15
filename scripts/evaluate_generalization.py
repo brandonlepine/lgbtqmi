@@ -261,8 +261,8 @@ def evaluate_items(
                 break
 
         # Corrected: baseline was wrong (or stereotyped), steered is correct
-        corrected = (not b_correct and s_correct)
-        corrupted = (b_correct and not s_correct)
+        corrected = bool(not b_correct and s_correct)
+        corrupted = bool(b_correct and not s_correct)
 
         results.append({
             "item_idx": item.get("item_idx", i),
