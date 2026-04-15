@@ -337,7 +337,7 @@ def analyze_token_level(
 
         # Find top-k token positions, filtering out special/trivial tokens
         # Fetch extra candidates so we still get top_k after filtering
-        n_candidates = min(top_k_tokens * 4, seq_len)
+        n_candidates = min(top_k_tokens * 8, seq_len)
         top_vals, top_idxs = torch.topk(per_pos, n_candidates)
 
         special_ids = set()
@@ -345,6 +345,24 @@ def analyze_token_level(
             tid = getattr(tokenizer, attr, None)
             if tid is not None:
                 special_ids.add(tid)
+
+        # Filter function words, determiners, prepositions, etc.
+        _STOPWORDS = {
+            "the", "a", "an", "is", "was", "are", "were", "be", "been",
+            "being", "have", "has", "had", "do", "does", "did", "will",
+            "would", "could", "should", "may", "might", "shall", "can",
+            "to", "of", "in", "for", "on", "with", "at", "by", "from",
+            "as", "into", "through", "during", "before", "after",
+            "and", "but", "or", "nor", "not", "so", "yet", "both",
+            "that", "this", "these", "those", "it", "its",
+            "he", "she", "his", "her", "him", "they", "them", "their",
+            "we", "our", "you", "your", "my", "me", "i",
+            "who", "whom", "which", "what", "where", "when", "how",
+            "if", "then", "than", "no", "yes", "all", "each", "every",
+            "about", "up", "out", "just", "also", "very", "often",
+            "over", "such", "only", "own", "same", "other", "new",
+            "one", "two", "said", "like", "going", "having", "being",
+        }
 
         token_details = []
         for pos_idx, act_val in zip(top_idxs.tolist(), top_vals.tolist()):
@@ -357,7 +375,9 @@ def analyze_token_level(
                 continue
             token_str = tokenizer.decode([token_id]).strip()
             if not token_str or len(token_str) <= 1:
-                continue  # skip empty/single-char punctuation
+                continue  # skip empty/single-char tokens
+            if token_str.lower() in _STOPWORDS:
+                continue
             token_details.append({
                 "position": pos_idx,
                 "token": token_str,
@@ -508,7 +528,10 @@ def compute_cooccurrence(
                 mat[i, j] = float(feat_acts[fidx])
 
     # Pearson correlation — replace NaN with 0 (constant-activation features)
-    corr = np.corrcoef(mat.T)
+    import warnings
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        corr = np.corrcoef(mat.T)
     if corr.ndim == 0:
         corr = np.array([[1.0]])
     corr = np.nan_to_num(corr, nan=0.0)
