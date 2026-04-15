@@ -66,8 +66,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--categories", default=None)
     p.add_argument("--max_items", type=int, default=None)
     p.add_argument("--output_dir", default=None)
-    p.add_argument("--token_level", action="store_true",
-                   help="Run expensive token-level analysis for top-3 features per subgroup")
+    p.add_argument("--skip_token_level", action="store_true",
+                   help="Skip token-level analysis (runs by default)")
     p.add_argument("--skip_figures", action="store_true")
     return p.parse_args()
 
@@ -830,13 +830,19 @@ def main() -> None:
             expansion=args.sae_expansion, device=args.device,
         )
 
-    # Load model wrapper for token-level analysis
-    wrapper = None
-    if args.token_level:
-        log("Loading model for token-level analysis ...")
-        from src.models.wrapper import ModelWrapper
-        wrapper = ModelWrapper.from_pretrained(args.model_path, device=args.device)
-        log(f"  Model loaded: {wrapper.n_layers} layers, hidden_dim={wrapper.hidden_dim}")
+    # Load model (needed for logit attribution and token-level analysis)
+    log("Loading model ...")
+    from src.models.wrapper import ModelWrapper
+    wrapper = ModelWrapper.from_pretrained(args.model_path, device=args.device)
+    log(f"  Model loaded: {wrapper.n_layers} layers, hidden_dim={wrapper.hidden_dim}")
+
+    # Pre-compute LM head weight for logit attribution (once, not per feature)
+    lm_head_weight = None
+    try:
+        lm_head_weight = wrapper.model.lm_head.weight.detach().float().cpu().numpy()
+        log(f"  LM head weight: {lm_head_weight.shape}")
+    except Exception as exc:
+        log(f"  WARNING: cannot access lm_head for logit attribution: {exc}")
 
     # Process per category
     all_reports: list[dict[str, Any]] = []
@@ -940,6 +946,25 @@ def main() -> None:
                 report["category"] = cat
                 report["cohens_d"] = feat.get("cohens_d", 0)
 
+                # Logit attribution: which output tokens does this feature promote/suppress
+                if lm_head_weight is not None:
+                    from src.sae_localization.feature_characterization import _logit_attribution
+                    try:
+                        logit_attr = _logit_attribution(
+                            fidx, sae, lm_head_weight, wrapper.tokenizer, top_k=10,
+                        )
+                        report["top_promoted_tokens"] = logit_attr["promoted"][:5]
+                        report["top_suppressed_tokens"] = logit_attr["suppressed"][:5]
+                        promoted_str = ", ".join(
+                            f'"{t["token"]}"({t["logit_change"]:.2f})'
+                            for t in logit_attr["promoted"][:3]
+                        )
+                        log(f"    F{fidx} logit attr: promotes {promoted_str}")
+                    except Exception as exc:
+                        log(f"    F{fidx} logit attribution failed: {exc}")
+                        report["top_promoted_tokens"] = []
+                        report["top_suppressed_tokens"] = []
+
                 # Analysis B: Specificity
                 spec = compute_specificity(fidx, layer, sae, hs, stimuli, subgroups_in_cat)
                 report["specificity"] = spec
@@ -967,8 +992,8 @@ def main() -> None:
                     cat_cooccurrence[sub] = cooc
                     atomic_save_json(cooc, output_dir / f"cooccurrence_{cat}_{sub}.json")
 
-            # Analysis A2: Token-level (if --token_level and model loaded)
-            if wrapper is not None:
+            # Analysis A2: Token-level (if --token_level)
+            if not args.skip_token_level:
                 top_n_features = min(3, len(features))
                 log(f"    Token-level analysis for top-{top_n_features} features ...")
                 sub_token_reports: list[dict] = []

@@ -351,6 +351,7 @@ if [[ "${RUN_SAE}" == "1" ]]; then
       --localization_dir "${SAE_LOCALIZATION_DIR}" \
       --output_dir "${SAE_ANALYSIS_DIR}" \
       --dim_dir "${SAE_DIM_DIR}" \
+      --load_model \
       "${SAE_LAYERS_ARGS[@]}" \
       "${SAE_MAX_ITEMS_ARGS[@]}"
 
@@ -394,7 +395,6 @@ if [[ "${RUN_SAE}" == "1" ]]; then
         --localization_dir "${SAE_LOCALIZATION_DIR}" \
         --ranked_features "${RANKED_PATH}" \
         --categories "${SAE_CATEGORIES}" \
-        --token_level \
         "${SAE_MAX_ITEMS_ARGS[@]}"
 
       echo
