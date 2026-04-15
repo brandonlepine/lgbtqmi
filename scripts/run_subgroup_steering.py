@@ -200,8 +200,8 @@ def _phase1_prune_alphas(
             f"corrupt={corrupt_rate:.3f} degen={degen_rate:.3f} "
             f"{'VIABLE' if is_viable else 'pruned'}")
 
-    if len(viable) < 3:
-        log(f"    Phase 1: only {len(viable)} viable alphas, keeping all {len(alpha_values)}")
+    if len(viable) == 0:
+        log(f"    Phase 1: no viable alphas found, keeping all {len(alpha_values)}")
         return alpha_values
 
     log(f"    Phase 1: {len(viable)}/{len(alpha_values)} alphas viable: {viable}")

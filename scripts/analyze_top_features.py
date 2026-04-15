@@ -335,20 +335,37 @@ def analyze_token_level(
         per_pos = feat_acts[:, feature_idx]  # (seq_len,)
         last_act = float(per_pos[-1])
 
-        # Find top-k token positions
-        top_vals, top_idxs = torch.topk(per_pos, min(top_k_tokens, seq_len))
+        # Find top-k token positions, filtering out special/trivial tokens
+        # Fetch extra candidates so we still get top_k after filtering
+        n_candidates = min(top_k_tokens * 4, seq_len)
+        top_vals, top_idxs = torch.topk(per_pos, n_candidates)
+
+        special_ids = set()
+        for attr in ("bos_token_id", "eos_token_id", "pad_token_id"):
+            tid = getattr(tokenizer, attr, None)
+            if tid is not None:
+                special_ids.add(tid)
+
         token_details = []
         for pos_idx, act_val in zip(top_idxs.tolist(), top_vals.tolist()):
             if act_val <= 0:
                 break
+            if pos_idx == 0:
+                continue  # skip BOS position
             token_id = int(input_ids[pos_idx])
+            if token_id in special_ids:
+                continue
             token_str = tokenizer.decode([token_id]).strip()
+            if not token_str or len(token_str) <= 1:
+                continue  # skip empty/single-char punctuation
             token_details.append({
                 "position": pos_idx,
                 "token": token_str,
                 "token_id": token_id,
                 "activation": round(act_val, 4),
             })
+            if len(token_details) >= top_k_tokens:
+                break
 
         item_activations.append((item_idx, last_act, token_details))
 
